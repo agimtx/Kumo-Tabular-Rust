@@ -59,7 +59,13 @@ def export_scaled_dot_product_attention(
 ) -> torch.Tensor:
     if not enable_gqa:
         return original_scaled_dot_product_attention(
-            query, key, value, attn_mask, dropout_p, is_causal, scale
+            query,
+            key,
+            value,
+            attn_mask,
+            dropout_p,
+            is_causal,
+            scale=scale,
         )
 
     repeats = query.size(-3) // key.size(-3)
