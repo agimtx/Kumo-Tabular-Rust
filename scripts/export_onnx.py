@@ -246,14 +246,8 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
         fix_sdpa_key_length_gathers(graph, size)
         casts = []
         fp8_lookup_name = "__fp8_e4m3fn_to_fp32"
-        if quantization == "fp8":
-            fp8_values = np.arange(256, dtype=np.uint8).view(
-                ml_dtypes.float8_e4m3fn
-            ).astype(np.float32)
-            graph.graph.initializer.append(
-                numpy_helper.from_array(fp8_values, name=fp8_lookup_name)
-            )
-        for weight in list(graph.graph.initializer):
+        original_initializers = list(graph.graph.initializer)
+        for weight in original_initializers:
             if weight.data_type != TensorProto.FLOAT:
                 continue
             name = weight.name
@@ -300,6 +294,13 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                     "Cast", [compressed.name], [name], name=name + "_to_fp32",
                     to=TensorProto.FLOAT,
                 ))
+        if quantization == "fp8":
+            fp8_values = np.arange(256, dtype=np.uint8).view(
+                ml_dtypes.float8_e4m3fn
+            ).astype(np.float32)
+            graph.graph.initializer.append(
+                numpy_helper.from_array(fp8_values, name=fp8_lookup_name)
+            )
         for cast in reversed(casts):
             graph.graph.node.insert(0, cast)
         onnx.save_model(
