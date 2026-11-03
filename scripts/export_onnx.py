@@ -245,6 +245,14 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
         graph = onnx.load(str(fp32_path))
         fix_sdpa_key_length_gathers(graph, size)
         casts = []
+        fp8_lookup_name = "__fp8_e4m3fn_to_fp32"
+        if quantization == "fp8":
+            fp8_values = np.arange(256, dtype=np.uint8).view(
+                ml_dtypes.float8_e4m3fn
+            ).astype(np.float32)
+            graph.graph.initializer.append(
+                numpy_helper.from_array(fp8_values, name=fp8_lookup_name)
+            )
         for weight in list(graph.graph.initializer):
             if weight.data_type != TensorProto.FLOAT:
                 continue
@@ -256,9 +264,8 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                 )
             elif quantization == "fp8":
                 encoded = values.astype(ml_dtypes.float8_e4m3fn).view(np.uint8)
-                compressed = onnx.helper.make_tensor(
-                    name=name + "_fp8", data_type=TensorProto.FLOAT8E4M3FN,
-                    dims=values.shape, vals=encoded.tobytes(), raw=True,
+                compressed = numpy_helper.from_array(
+                    encoded, name=name + "_fp8_uint8"
                 )
             else:
                 max_abs = float(np.max(np.abs(values.astype(np.float64))))
@@ -272,11 +279,10 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                 )
             weight.CopyFrom(compressed)
             if quantization == "fp8":
-                cast = onnx.helper.make_node(
-                    "Cast", [compressed.name], [name], name=name + "_to_fp32",
-                    to=TensorProto.FLOAT,
-                )
-                casts.append(cast)
+                casts.append(onnx.helper.make_node(
+                    "Gather", [fp8_lookup_name, compressed.name], [name],
+                    name=name + "_fp8_decode", axis=0,
+                ))
             elif quantization == "int4":
                 graph.graph.initializer.append(
                     numpy_helper.from_array(np.asarray(scale, dtype=np.float32), name=name + "_scale")
