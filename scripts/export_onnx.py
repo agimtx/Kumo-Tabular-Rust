@@ -261,9 +261,11 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                     dims=values.shape, vals=encoded.tobytes(), raw=True,
                 )
             else:
-                scale = float(np.max(np.abs(values))) / 7.0
-                scale = scale if scale > 0 else 1.0
-                encoded = encode_int4(values / scale)
+                max_abs = float(np.max(np.abs(values.astype(np.float64))))
+                if not np.isfinite(max_abs):
+                    raise ValueError(f"non-finite weight values in {name}")
+                scale = max_abs / 7.0 if max_abs > 0 else 1.0
+                encoded = encode_int4(values.astype(np.float64) / scale)
                 compressed = onnx.helper.make_tensor(
                     name=name + "_int4", data_type=TensorProto.INT4,
                     dims=values.shape, vals=encoded.tobytes(), raw=True,
