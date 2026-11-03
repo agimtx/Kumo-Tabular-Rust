@@ -5,15 +5,30 @@ query row index is read from Rust's --trace output; no Python split is drawn.
 """
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
+import sys
 import time
 
 import numpy as np
 import pandas as pd
 import sdm
 import torch
+
+
+def note(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def batches_fingerprint(trace: dict) -> str:
+    digest = hashlib.sha256()
+    for split in ("validation", "test"):
+        for batch in trace[f"{split}_batches"]:
+            digest.update(np.asarray(batch["context"], dtype=np.int64).tobytes())
+            digest.update(np.asarray(batch["query"], dtype=np.int64).tobytes())
+    return digest.hexdigest()[:32]
 
 
 def auc(truth: np.ndarray, scores: np.ndarray) -> float:
@@ -66,7 +81,13 @@ def main() -> None:
     parser.add_argument("--precision", choices=("fp16", "fp8", "int4"), default="fp16")
     args = parser.parse_args()
     trace_path = Path(f"output/medium-{args.task}-context-{args.context_rows}-seed-{args.seed}-trace.json")
-    report_path = Path(f"output/medium-{args.task}-{args.precision}-full-evaluation-rust.json")
+    if args.context_rows == 32:
+        report_path = Path(f"output/medium-{args.task}-{args.precision}-full-evaluation-rust.json")
+    else:
+        report_path = Path(
+            f"output/medium-{args.task}-{args.precision}-full-context-{args.context_rows}"
+            "-evaluation-rust.json"
+        )
     trace = json.loads(trace_path.read_text())
     rust_report = json.loads(report_path.read_text())[0]
     if rust_report["task"] != args.task or rust_report["precision"] != args.precision:
@@ -74,63 +95,92 @@ def main() -> None:
     dataframe = pd.read_parquet(trace["dataset"])
     assert len(dataframe) > max(trace["fit"] + trace["validation"] + trace["test"])
     assert list(dataframe.drop(columns=trace["target"]).columns) == trace["features"]
-    stypes = {column: ("categorical" if pd.api.types.is_string_dtype(dataframe[column])
-                         else "numerical") for column in trace["features"]}
-    stypes[trace["target"]] = "categorical" if args.task == "classification" else "numerical"
-    table = sdm.TableTensor.from_pandas(dataframe, stypes=stypes, device=args.device)
-    model = load_model(args.task, args.device)
-
-    def predict(batches: list[dict], label: str) -> np.ndarray:
-        predictions = []
-        for index, batch in enumerate(batches):
-            context = table[batch["context"]]
-            query = table[batch["query"]]
-            generator = torch.Generator(device=args.device).manual_seed(args.seed + index)
-            result = model(
-                x_context=context.drop_columns(trace["target"]),
-                y_context=context.select_columns([trace["target"]]),
-                x_query=query.drop_columns(trace["target"]),
-                num_estimators=1,
-                generator=generator,
-            )
-            if args.task == "classification":
-                names = list(result.columns[sdm.Stype.numerical])
-                probabilities = result.numerical.detach().cpu().numpy()
-                scores = np.log(probabilities[:, names.index("Yes")]) - np.log(probabilities[:, names.index("No")])
-                predictions.extend(scores.tolist())
-            else:
-                quantiles = result.numerical.detach().cpu().numpy()
-                predictions.extend(quantiles[:, 499].tolist())
-            if (index + 1) % 50 == 0:
-                print(f"{args.task} {label}: {index+1}/{len(batches)} batches", flush=True)
-        return np.asarray(predictions, dtype=np.float64)
-
-    start = time.monotonic()
-    validation_predictions = predict(trace["validation_batches"], "validation")
-    test_predictions = predict(trace["test_batches"], "test")
-    elapsed = time.monotonic() - start
+    fingerprint = batches_fingerprint(trace)
+    # The FP32 checkpoint and its input batches do not depend on the ONNX
+    # precision, so all three comparisons share one replay result.
+    cache_path = Path(
+        f"output/medium-{args.task}-context-{args.context_rows}-seed-{args.seed}"
+        "-official-predictions.json"
+    )
+    cached = json.loads(cache_path.read_text()) if cache_path.exists() else None
+    if cached is not None and cached.get("fingerprint") != fingerprint:
+        note(f"official predictions cache is stale for {args.task}; replaying")
+        cached = None
     truth = dataframe[trace["target"]].to_numpy()
-    if args.task == "classification":
-        validation_truth = (truth[trace["validation"]] == "Yes").astype(np.float64)
-        test_truth = (truth[trace["test"]] == "Yes").astype(np.float64)
-        cut = float(select_threshold(validation_truth, validation_predictions))
-        tn, fp, fn, tp = counts(test_truth, test_predictions, cut)
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-        metrics = {
-            "accuracy": (tn + tp) / len(test_truth),
-            "balanced_accuracy": balanced(test_truth, test_predictions, cut),
-            "roc_auc_yes": auc(test_truth, test_predictions),
-            "precision_yes": precision, "recall_yes": recall,
-            "f1_yes": 2 * precision * recall / max(precision + recall, float(np.finfo(float).eps)),
-            "confusion_matrix_no_yes": [[tn, fp], [fn, tp]],
-        }
+
+    if cached is not None:
+        note(f"official predictions cache hit: {cache_path}")
+        validation_predictions = np.asarray(cached["validation_predictions"], dtype=np.float64)
+        test_predictions = np.asarray(cached["test_predictions"], dtype=np.float64)
+        cut = cached["classification_threshold"]
+        metrics = cached["metrics"]
+        elapsed = cached["evaluation_seconds"]
     else:
-        cut = None
-        test_truth = truth[trace["test"]].astype(float)
-        error = test_predictions - test_truth
-        metrics = {"mae": float(np.abs(error).mean()), "rmse": float(np.sqrt(np.square(error).mean())),
-                   "r2": float(1 - np.square(error).sum() / np.square(test_truth - test_truth.mean()).sum())}
+        stypes = {column: ("categorical" if pd.api.types.is_string_dtype(dataframe[column])
+                             else "numerical") for column in trace["features"]}
+        stypes[trace["target"]] = "categorical" if args.task == "classification" else "numerical"
+        table = sdm.TableTensor.from_pandas(dataframe, stypes=stypes, device=args.device)
+        note(f"loading official checkpoint and replaying batches for {args.task}")
+        model = load_model(args.task, args.device)
+
+        def predict(batches: list[dict], label: str) -> np.ndarray:
+            predictions = []
+            for index, batch in enumerate(batches):
+                context = table[batch["context"]]
+                query = table[batch["query"]]
+                generator = torch.Generator(device=args.device).manual_seed(args.seed + index)
+                result = model(
+                    x_context=context.drop_columns(trace["target"]),
+                    y_context=context.select_columns([trace["target"]]),
+                    x_query=query.drop_columns(trace["target"]),
+                    num_estimators=1,
+                    generator=generator,
+                )
+                if args.task == "classification":
+                    names = list(result.columns[sdm.Stype.numerical])
+                    probabilities = result.numerical.detach().cpu().numpy()
+                    scores = np.log(probabilities[:, names.index("Yes")]) - np.log(probabilities[:, names.index("No")])
+                    predictions.extend(scores.tolist())
+                else:
+                    quantiles = result.numerical.detach().cpu().numpy()
+                    predictions.extend(quantiles[:, 499].tolist())
+                if (index + 1) % 50 == 0:
+                    note(f"{args.task} {label}: {index+1}/{len(batches)} batches")
+            return np.asarray(predictions, dtype=np.float64)
+
+        start = time.monotonic()
+        validation_predictions = predict(trace["validation_batches"], "validation")
+        test_predictions = predict(trace["test_batches"], "test")
+        elapsed = time.monotonic() - start
+        if args.task == "classification":
+            validation_truth = (truth[trace["validation"]] == "Yes").astype(np.float64)
+            test_truth = (truth[trace["test"]] == "Yes").astype(np.float64)
+            cut = float(select_threshold(validation_truth, validation_predictions))
+            tn, fp, fn, tp = counts(test_truth, test_predictions, cut)
+            precision = tp / max(tp + fp, 1)
+            recall = tp / max(tp + fn, 1)
+            metrics = {
+                "accuracy": (tn + tp) / len(test_truth),
+                "balanced_accuracy": balanced(test_truth, test_predictions, cut),
+                "roc_auc_yes": auc(test_truth, test_predictions),
+                "precision_yes": precision, "recall_yes": recall,
+                "f1_yes": 2 * precision * recall / max(precision + recall, float(np.finfo(float).eps)),
+                "confusion_matrix_no_yes": [[tn, fp], [fn, tp]],
+            }
+        else:
+            cut = None
+            test_truth = truth[trace["test"]].astype(float)
+            error = test_predictions - test_truth
+            metrics = {"mae": float(np.abs(error).mean()), "rmse": float(np.sqrt(np.square(error).mean())),
+                       "r2": float(1 - np.square(error).sum() / np.square(test_truth - test_truth.mean()).sum())}
+        cache_path.write_text(json.dumps({
+            "fingerprint": fingerprint, "task": args.task, "context_rows": args.context_rows,
+            "seed": args.seed, "classification_threshold": cut, "metrics": metrics,
+            "evaluation_seconds": elapsed,
+            "validation_predictions": validation_predictions.tolist(),
+            "test_predictions": test_predictions.tolist(),
+        }, indent=2) + "\n")
+        note(f"cached official predictions: {cache_path}")
     if not all(math.isfinite(value) for value in (validation_predictions.tolist() + test_predictions.tolist())):
         raise ValueError("official predictions contain nonfinite values")
     rust = np.asarray(rust_report["test_predictions"], dtype=float)
@@ -155,10 +205,14 @@ def main() -> None:
               "num_estimators": 1, "device": args.device, "evaluation_seconds": elapsed,
               "classification_threshold": cut, "metrics": metrics, "comparison_to_rust": comparison,
               "test_predictions": test_predictions.tolist(), "validation_predictions": validation_predictions.tolist()}
-    output_path = Path(f"output/medium-{args.task}-{args.precision}-official-comparison.json")
+    suffix = "" if args.context_rows == 32 else f"-context-{args.context_rows}"
+    output_path = Path(f"output/medium-{args.task}-{args.precision}{suffix}-official-comparison.json")
     output_path.write_text(json.dumps(output, indent=2) + "\n")
-    print(json.dumps({key: output[key] for key in ("task", "metrics", "comparison_to_rust", "evaluation_seconds")}, indent=2), flush=True)
-    print(f"Report: {output_path}", flush=True)
+    summary = {"task": args.task, "precision": args.precision, "metrics": metrics,
+               "official_minus_onnx": comparison["official_minus_rust_metrics"],
+               "prediction_pearson": comparison["prediction_pearson"],
+               "prediction_mae_difference": comparison["prediction_mae_difference"]}
+    note(f"{json.dumps(summary)}\nReport: {output_path}")
 
 
 if __name__ == "__main__":

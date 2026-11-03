@@ -46,7 +46,7 @@ The export script and workflow are described below. For external-data ONNX model
 
 ## Export ONNX
 
-In GitHub Actions, run **Export Kumo Tabular ONNX** manually and choose the model size, task, and weight precision (`fp16`, `fp8`, `int4`, or `all` to export all three). The workflow downloads the matching checkpoint from NVIDIA Kumo-Tabular and provides the `.onnx` file as a run artifact. Weights are stored in the selected low-precision format and converted to FP32 for computation; all three formats are lossy. INT4 uses symmetric per-tensor scaling and stores signed 4-bit weights packed into bytes, which the graph unpacks with standard ONNX operators. The exporter also repairs a legacy tracing bug in ICL attention key-length selection (`key.size(-3)`), validates all expected query-scaling paths, then stores the graph. This correction is required for correct context-dependent logits.
+In GitHub Actions, run **Export Kumo Tabular ONNX** manually and choose the model size, task, and weight precision (`fp16`, `fp8`, `int4`, or `all` to export all three). The workflow downloads the matching checkpoint from NVIDIA Kumo-Tabular and provides the `.onnx` file as a run artifact. Weights are stored in the selected low-precision format and converted to FP32 for computation; all three formats are lossy. INT4 quantizes only 2-D matrix weights with at least 4096 elements: each output channel gets its own symmetric scale, signed 4-bit values are packed two per byte, and the graph unpacks them with standard ONNX operators. Small vectors and scalars (biases, normalization weights, frequencies, attention scales) stay in FP32 because they are numerically sensitive and save negligible space. The exporter also repairs a legacy tracing bug in ICL attention key-length selection (`key.size(-3)`), validates all expected query-scaling paths, then stores the graph. This correction is required for correct context-dependent logits.
 
 Local export with an existing small classifier checkpoint:
 
@@ -196,50 +196,122 @@ AUC, balanced accuracy, accuracy, or F1 means it scores higher.
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Classification | FP16 | - / 0.6740 | - / 0.6227 | - / 0.6483 | - / 0.6557 | - / 0.6175 | - / 0.6192 | - / -0.0183 | - / -0.0052 | - / -0.0291 |
 | Classification | FP8 | - / 0.6715 | - / 0.6016 | - / 0.5116 | - / 0.6557 | - / 0.6175 | - / 0.6192 | - / -0.0158 | - / +0.0159 | - / +0.1076 |
-| Classification | INT4 | - / 0.4274 | - / 0.4567 | - / 0.2151 | - / 0.6557 | - / 0.6175 | - / 0.6192 | - / +0.2282 | - / +0.1608 | - / +0.4041 |
+| Classification | INT4 | - / 0.6588 | - / 0.6354 | - / 0.5320 | - / 0.6557 | - / 0.6175 | - / 0.6192 | - / -0.0031 | - / -0.0179 | - / +0.0872 |
 | Regression | FP16 | 2.9421 / - | 3.9460 / - | 0.6783 / - | 2.9675 / - | 4.0062 / - | 0.6684 / - | +0.0254 / - | +0.0602 / - | -0.0099 / - |
 | Regression | FP8 | 3.0223 / - | 4.0427 / - | 0.6624 / - | 2.9675 / - | 4.0062 / - | 0.6684 / - | -0.0548 / - | -0.0365 / - | +0.0061 / - |
-| Regression | INT4 | 5.6742 / - | 6.9951 / - | -0.0108 / - | 2.9675 / - | 4.0062 / - | 0.6684 / - | -2.7067 / - | -2.9889 / - | +0.6793 / - |
+| Regression | INT4 | 5.2782 / - | 6.4807 / - | 0.1324 / - | 2.9675 / - | 4.0062 / - | 0.6684 / - | -2.3107 / - | -2.4745 / - | +0.5361 / - |
 
 The `.pt` metrics repeat for all three rows because this is the same FP32
 checkpoint and its input batches are fixed; the differences isolate the result
 of each ONNX model/pipeline against that baseline. FP16 and FP8 regression are
-close to the original model on these metrics. INT4 regression degrades sharply
-(MAE 5.674 versus 2.967 and R2 -0.011 versus 0.668). For classification,
-FP16/FP8 ranking AUC is close to the baseline, while INT4 falls to 0.427. All
+close to the original model on these metrics. The repaired INT4 encoding
+(per-output-channel scales for matrix weights, FP32 retention for small
+vectors and scalars) raised classification AUC from 0.427 to 0.659 and
+regression R2 from -0.011 to 0.132, but regression INT4 remains far from the
+FP32 baseline (MAE 5.278 versus 2.967). Classification INT4 ranking is now
+close to the baseline; its accuracy and yes-class F1 still trail FP16. All
 classification accuracies are below the all-No baseline of 0.8866, so accuracy
-alone is not informative for this imbalanced dataset.
+alone is not informative for this imbalanced dataset. A consolidated report
+with this table and the context-size tables below is written to
+`output/quantization-comparison-report.md` (JSON alongside it) by
+`scripts/summarize_quantization.py`.
+
+Context-size sensitivity for the same held-out rows (32 rows is the table
+above; 16 and 64 rerun everything with the same seed and split, and the `.pt`
+checkpoint is replayed on the matching batches at each size). Classification:
+
+| Context rows | Rust FP16 AUC / bal.acc | Rust INT4 AUC / bal.acc | Official PT AUC / bal.acc | Official − INT4, AUC / bal.acc |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 0.5912 / 0.5710 | 0.5707 / 0.5532 | 0.6460 / 0.5749 | +0.0753 / +0.0218 |
+| 32 | 0.6740 / 0.6227 | 0.6588 / 0.6354 | 0.6557 / 0.6175 | -0.0031 / -0.0179 |
+| 64 | 0.6256 / 0.6089 | 0.6356 / 0.6116 | 0.6559 / 0.6351 | +0.0203 / +0.0235 |
+
+Regression:
+
+| Context rows | Rust FP16 MAE / R2 | Rust INT4 MAE / R2 | Official PT MAE / R2 | Official − INT4, MAE / R2 |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 4.6066 / 0.2436 | 5.5734 / 0.0288 | 4.5496 / 0.2605 | -1.0238 / +0.2317 |
+| 32 | 2.9421 / 0.6783 | 5.2782 / 0.1324 | 2.9675 / 0.6684 | -2.3107 / +0.5361 |
+| 64 | 2.2806 / 0.8093 | 5.0880 / 0.2078 | 2.3425 / 0.7987 | -2.7455 / +0.5909 |
+
+INT4 classification ranking now tracks the official checkpoint closely at every
+size (AUC within 0.075, and within 0.024 at 32/64 rows); balanced accuracy is
+also close. Regression is the remaining failure: more context improves INT4
+MAE from 5.573 to 5.088, but FP16 improves much faster, so the INT4-vs-FP16 gap
+grows from 0.97 to 2.81 and the INT4-vs-official gap from 1.02 to 2.75. INT4
+regression predictions also lose spread: their standard deviation is 1.2-1.9
+over test rows versus 5.9-6.4 for FP16, so the median quantile stays near the
+mean instead of tracking the input. This is consistent with quantization error
+accumulating through the 24 ICL layers rather than a context-length bug. Only
+`medium` models exist locally in `models/`, so no small/large size comparison
+is included; `small/classifier.pt` and `small/regressor.pt` would be needed as
+well.
 
 This is an end-to-end comparison, **not a pure weight-quantization error test**:
 Rust and Python use different recipe RNGs and arithmetic paths, although they
 receive the same context/query row indices. Prediction-level Pearson
-correlation and MAE are stored in the comparison JSON files. The lower
-classification INT4 correlation and regression INT4 correlation indicate a
-substantial prediction change beyond small floating-point rounding. Rust
-reports include held-out predictions and are task/precision-specific.
+correlation and MAE are stored in the comparison JSON files.
+`scripts/check_quantized_weights.py` reconstructs every packed INT4 matrix from
+its nibbles and per-output-row scale and compares it with the original
+checkpoint; for the current medium exports the quantized tensors have mean
+relative L2 error 0.143 (classification) / 0.146 (regression) and minimum
+cosine 0.962 / 0.909. Regression INT4 prediction correlation against `.pt`
+is 0.585, consistent with accumulated error across the 24-layer stack rather
+than a decode bug. The worst tensor is the final regression head,
+`icl_block.head.2.weight` (999×1024), at 0.423 relative L2 error; its
+per-output-row scale is set by each row's largest weight, so much of the
+remaining row rounds to zero or ±1. That layer produces the 999 quantiles
+directly, which explains the collapsed median spread. The classification head
+(10×1024) has 0.275 relative error but only affects ten logits, so its ranking
+survives. Keeping the regression head in FP32 (or quantizing it more finely)
+is the obvious next export change; do not use the current INT4 regression
+model for accuracy-sensitive work. Rust reports include held-out predictions
+and are task/precision-specific.
 
 Run all Rust reports (DuckDB CLI, ONNX Runtime dynamic library, and the six
 medium ONNX models are required), then run the original `.pt` comparison for
-each task and precision:
+each task and precision. Use `--context-rows 16` / `64` for the context-size
+tables; `evaluate_full` and `compare_official_medium.py` write
+`-full-context-N` / `-context-N` report names automatically:
 
 ```sh
 CARGO_HOME="$PWD/.cargo-home" ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
   cargo run --locked --offline --release --bin evaluate_full -- \
   --seed 42 --size medium --trace
+# Faster verification of one precision only (smaller memory footprint):
+CARGO_HOME="$PWD/.cargo-home" ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
+  cargo run --locked --offline --release --bin evaluate_full -- \
+  --seed 42 --size medium --precision int4 --trace
 for task in classification regression; do
   for precision in fp16 fp8 int4; do
     OMP_NUM_THREADS=4 .venv-official/bin/python scripts/compare_official_medium.py \
       --task "$task" --precision "$precision" --seed 42 --context-rows 32
   done
 done
+.venv-official/bin/python scripts/summarize_quantization.py
 ```
 
-Rust reports are `output/medium-{classification,regression}-{fp16,fp8,int4}-full-evaluation-rust.json`;
-original checkpoint comparison reports are
-`output/medium-{classification,regression}-{fp16,fp8,int4}-official-comparison.json`.
+Run evaluations sequentially: each process loads a full medium ONNX session,
+and running two concurrently on a 16 GB machine pushes it into swap and looks
+like a hang. Only `medium` artifacts exist locally; `--size small` requires the
+small dynamic exports and `small/classifier.pt` / `small/regressor.pt`.
+
+`compare_official_medium.py` caches the FP32 checkpoint's replay per
+task/context/seed in
+`output/medium-{task}-context-{rows}-seed-{seed}-official-predictions.json`;
+all three precision comparisons reuse it, so six `.pt` comparisons cost two
+replays. The cache is invalidated when the traced batch indices change. Progress
+is printed to stderr and flushed, so a long replay is distinguishable from a
+hang.
+
+Rust reports are `output/medium-{classification,regression}-{fp16,fp8,int4}-full-evaluation-rust.json`
+(default 32 contexts; other sizes add `-full-context-{16,64}`); original
+checkpoint comparison reports are
+`output/medium-{classification,regression}-{fp16,fp8,int4}-official-comparison.json`
+(other sizes add `-context-{16,64}`).
 The separate `scripts/check_prepared_core_parity.py` remains the tool for
-checking raw core inference on identical prepared tensors.
-identical tensors against PyTorch; at 32 contexts, mean absolute output error is
-0.00165 for classification logits and 0.00020 for regression quantiles, with
-correlations above 0.999999. This isolates the former large gap to a legacy
-ONNX tracing bug, now repaired, rather than the FP16 conversion.
+checking raw core inference on identical prepared tensors against PyTorch; at
+32 contexts, mean absolute output error is 0.00165 for classification logits
+and 0.00020 for regression quantiles, with correlations above 0.999999. This
+isolates FP16 conversion error from recipe differences. INT4 conversion error
+is reported per tensor by `scripts/check_quantized_weights.py`.

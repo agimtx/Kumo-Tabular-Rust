@@ -318,6 +318,7 @@ fn evaluate(
         )
         .into());
     }
+    eprintln!("[{task:?} {precision}] loading dataset {path}");
     let (names, features, labels) = load_dataset(path, target)?;
     let names_ref = names.iter().map(String::as_str).collect::<Vec<_>>();
     let (fit, validation, test) = split(&labels, classification, seed);
@@ -329,6 +330,7 @@ fn evaluate(
     {
         return Err("insufficient fit rows for requested context size".into());
     }
+    eprintln!("[{task:?} {precision}] loading model {model}");
     let mut session = OnnxSession::load(&model)?;
     if session.input_names() != ["x", "y", "categorical_mask"]
         || session.output_names() != ["predictions"]
@@ -336,6 +338,7 @@ fn evaluate(
         return Err("unexpected ONNX tensor contract".into());
     }
     let mut validation_prepared = Vec::new();
+    eprintln!("[{task:?} {precision}] validation rows {}", validation.len());
     let (validation_scores, _, validation_batches) = infer(
         &mut session,
         &features,
@@ -349,6 +352,7 @@ fn evaluate(
         trace.then_some(&mut validation_prepared),
     )?;
     let mut test_prepared = Vec::new();
+    eprintln!("[{task:?} {precision}] held-out rows {}", test.len());
     let (predictions, elapsed, test_batches) = infer(
         &mut session,
         &features,
@@ -434,6 +438,7 @@ fn main() -> EvalResult<()> {
     let mut context_rows = DEFAULT_CONTEXT;
     let mut trace = false;
     let mut task_filter = "both".to_owned();
+    let mut precision_filter = "all".to_owned();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().ok_or("missing --seed value")?.parse()?,
@@ -443,6 +448,9 @@ fn main() -> EvalResult<()> {
             }
             "--trace" => trace = true,
             "--task" => task_filter = args.next().ok_or("missing --task value")?,
+            "--precision" => {
+                precision_filter = args.next().ok_or("missing --precision value")?
+            }
             _ => return Err(format!("unknown argument: {arg}").into()),
         }
     }
@@ -461,8 +469,15 @@ fn main() -> EvalResult<()> {
         "regression" => vec![("regression", Task::Regression)],
         _ => return Err("task must be classification, regression or both".into()),
     };
+    let precisions: Vec<&str> = match precision_filter.as_str() {
+        "all" => vec!["fp16", "fp8", "int4"],
+        "fp16" => vec!["fp16"],
+        "fp8" => vec!["fp8"],
+        "int4" => vec!["int4"],
+        _ => return Err("precision must be fp16, fp8, int4 or all".into()),
+    };
     for size in sizes {
-        for precision in ["fp16", "fp8", "int4"] {
+        for precision in precisions.iter().copied() {
             let mut report = Vec::new();
             for &(name, task) in &tasks {
                 let model = format!("models/kumo-tabular-{size}-{name}-dynamic-{precision}.onnx");
@@ -483,7 +498,11 @@ fn main() -> EvalResult<()> {
                 };
                 fs::create_dir_all("output")?;
                 fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&vec![result])?))?;
-                println!("{size} {task_name} {precision} report: {path}");
+                let metrics = &result["metrics"];
+                println!(
+                    "{size} {task_name} {precision}: test_rows={} metrics={} report={path}",
+                    result["test_rows"], metrics
+                );
             }
         }
     }

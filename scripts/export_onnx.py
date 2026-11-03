@@ -176,13 +176,38 @@ def fix_sdpa_key_length_gathers(graph: onnx.ModelProto, size: str) -> None:
         )
 
 
-def encode_int4(values: np.ndarray) -> np.ndarray:
-    """Round signed values in [-8, 7] and pack them into ONNX INT4 nibbles."""
-    quantized = np.clip(np.rint(values), -8, 7).astype(np.int8).reshape(-1)
+INT4_MIN_MATRIX_ELEMENTS = 4096
+
+
+def quantize_int4(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Symmetrically quantize each output channel along the final axis."""
+    source = np.asarray(values, dtype=np.float32)
+    if source.ndim < 2:
+        raise ValueError("INT4 is only used for matrix weights")
+    rows = source.reshape(-1, source.shape[-1]).astype(np.float64)
+    maxima = np.max(np.abs(rows), axis=-1)
+    scales = np.where(maxima > 0, maxima / 7.0, 1.0).astype(np.float32)
+    quantized = np.clip(np.rint(rows / scales[:, None]), -8, 7).astype(np.int8)
+    return quantized.reshape(source.shape), scales.reshape(source.shape[:-1])
+
+
+def pack_int4(values: np.ndarray) -> np.ndarray:
+    """Pack signed INT4 values in row-major order, low nibble first."""
+    quantized = np.asarray(values, dtype=np.int8).reshape(-1)
     if quantized.size % 2:
         quantized = np.pad(quantized, (0, 1))
     nibbles = quantized.astype(np.uint8) & 0x0F
     return nibbles[0::2] | (nibbles[1::2] << 4)
+
+
+def unpack_int4(values: np.ndarray, count: int) -> np.ndarray:
+    """Unpack low-nibble-first signed INT4 values for exporter tests."""
+    packed = np.asarray(values, dtype=np.uint8).reshape(-1)
+    nibbles = np.empty(packed.size * 2, dtype=np.int8)
+    nibbles[0::2] = (packed & 0x0F).astype(np.int8)
+    nibbles[1::2] = (packed >> 4).astype(np.int8)
+    nibbles[nibbles >= 8] -= 16
+    return nibbles[:count]
 
 
 def export(checkpoint: Path, output: Path, size: str, task: str, quantization: str) -> None:
@@ -261,15 +286,16 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                 compressed = numpy_helper.from_array(
                     encoded, name=name + "_fp8_uint8"
                 )
-            else:
-                max_abs = float(np.max(np.abs(values.astype(np.float64))))
-                if not np.isfinite(max_abs):
+            elif quantization == "int4" and values.ndim >= 2 and values.size >= INT4_MIN_MATRIX_ELEMENTS:
+                if not np.isfinite(values).all():
                     raise ValueError(f"non-finite weight values in {name}")
-                scale = max_abs / 7.0 if max_abs > 0 else 1.0
-                encoded = encode_int4(values.astype(np.float64) / scale)
-                compressed = numpy_helper.from_array(
-                    encoded, name=name + "_int4_packed_uint8"
-                )
+                quantized, scales = quantize_int4(values)
+                encoded = pack_int4(quantized)
+                compressed = numpy_helper.from_array(encoded, name=name + "_int4_packed_uint8")
+            elif quantization == "int4":
+                # Small vectors and scalars are numerically sensitive and save
+                # negligible space, so retain them in FP32.
+                continue
             weight.CopyFrom(compressed)
             if quantization == "fp8":
                 indices_name = name + "_fp8_indices"
@@ -290,7 +316,9 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                 gathered_name = name + "_int4_pairs"
                 indices_name = name + "_int4_indices"
                 graph.graph.initializer.extend((
-                    numpy_helper.from_array(np.asarray(scale, dtype=np.float32), name=name + "_scale"),
+                    numpy_helper.from_array(
+                        scales.reshape(values.shape[:-1] + (1,)), name=name + "_scale"
+                    ),
                     numpy_helper.from_array(np.asarray([-1], dtype=np.int64), name=name + "_flat_shape"),
                     numpy_helper.from_array(np.asarray([0], dtype=np.int64), name=name + "_slice_start"),
                     numpy_helper.from_array(np.asarray([values.size], dtype=np.int64), name=name + "_slice_end"),
