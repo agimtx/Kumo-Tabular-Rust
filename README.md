@@ -29,16 +29,16 @@ Local export with an existing small classifier checkpoint:
 ```sh
 python -m pip install 'torch>=2.7' structured-data-models onnx
 python scripts/export_onnx.py --size small --task classification \
-  --checkpoint smail/classifier.pt --output output/kumo-tabular-small-classification-fp16.onnx
+  --checkpoint smail/classifier.pt --output small/kumo-tabular-small-classification-fp16.onnx
 ```
 
 ## Validation
 
 Run `cargo test` to test table conversion, preprocessing, and model-contract handling.
 
-## FP16 and FP32 model dataset evaluation
+## Small and medium FP16 model dataset evaluation
 
-With the two local Parquet files and FP16/FP32 ONNX exports in place, make the
+With the two local Parquet files and FP16 ONNX exports in `small/` and `medium/`, make the
 DuckDB CLI and a compatible ONNX Runtime dynamic library available. The Rust
 CLI uses `OnnxSession` for inference; Python is not involved. For example, on
 this machine:
@@ -46,39 +46,46 @@ this machine:
 ```sh
 CARGO_HOME="$PWD/.cargo-home" \
 ORT_DYLIB_PATH=/opt/homebrew/Caskroom/miniconda/base/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntime.1.23.0.dylib \
-cargo run --offline --release --bin evaluate_quantized -- --seed 42
+cargo run --offline --release --bin evaluate_quantized -- --seed 42 --size both
 ```
 
-Use `--precision fp32` to evaluate only the unquantized models, or
-`--precision both` to compare FP16 and FP32 using identical splits and context
-samples. The default is `fp16`. Output defaults to
-`output/quantized-evaluation-rust.json`,
-`output/unquantized-evaluation-rust.json`, or
-`output/precision-comparison-rust.json`, respectively; override with
-`--output PATH`. To run the FP32 end-to-end Rust test explicitly with local
-models and `ORT_DYLIB_PATH` configured:
+The default `--size both` runs small and medium independently and writes
+`output/small-evaluation-rust.json` and `output/medium-evaluation-rust.json`.
+Use `--size small` or `--size medium` to run only one size. Only FP16 models
+are evaluated; unquantized models are not used. Both sizes use the same seed,
+train/test split, validation split and context-row selection rules. To run the
+end-to-end Rust test explicitly with local models and `ORT_DYLIB_PATH` configured:
 
 ```sh
-cargo test --bin evaluate_quantized fp32_models_evaluate_both_datasets -- --ignored
+cargo test --bin evaluate_quantized quantized_models_evaluate_both_sizes_and_datasets -- --ignored
 ```
 
 Set `ORT_DYLIB_PATH` to the ONNX Runtime shared library on your machine; the
 local `CARGO_HOME` and `--offline` flags are optional when Cargo can access its
-normal cache and registry. The CLI uses a fixed, stratified 80/20 train/test
-split for classification and a seeded 80/20
-split for regression. Only training labels are supplied as context; each model
-call uses four context rows and two held-out query rows. Since the exported graph
-only accepts three columns, the selected features are recorded in the JSON.
-Numeric features are standardized using training-set statistics. The binary
-classifier uses the first two raw logits (class 0 = No, class 1 = Yes), rather
-than treating the 10 output scores as probabilities. Regression predictions
-use the median of 999 output quantiles, reversing the context-label scaling.
+normal cache and registry. The CLI uses a fixed stratified 80/20 train/test
+split for classification and a seeded 80/20 split for regression. It reserves
+20% of the training rows for validation. Using only validation labels, it
+selects random or nearest-feature context by ROC AUC (classification) or MAE
+(regression), and sets the binary classification threshold by balanced accuracy.
+The held-out test rows never influence these choices; only fit-set labels are
+supplied as model context. Each call uses four context rows and two query rows.
+Since the exported graphs accept only three features, the selected columns are
+recorded in the JSON. Features are standardized using fit-set statistics.
+The classifier uses the difference between the first two raw logits (class 0 =
+No, class 1 = Yes), not the 10 output scores as probabilities. Regression
+predictions use the median of 999 quantiles, reversing context-label scaling.
 
-With seed 42, Rust classification (344 test rows) gave FP16 accuracy 0.485 and
-ROC AUC 0.543 versus FP32 accuracy 0.483 and ROC AUC 0.543. Predicting No for
-every row has accuracy 0.887. Rust regression (301 test rows) gave FP16 MAE
-6.2496 and RMSE 7.9871 versus FP32 MAE 6.2499 and RMSE 7.9873. The training-mean
-baseline MAE is 5.648 and RMSE is 6.978. These are limited-context,
-three-feature evaluations of the *core* exports, not estimates for the public
-KumoTabular pipeline with its full
-preprocessing and larger context windows.
+With seed 42, classification (344 test rows) gives small accuracy 0.727,
+balanced accuracy 0.589, Yes-class F1 0.254, ROC AUC 0.606; medium accuracy
+0.509, balanced accuracy 0.533, Yes-class F1 0.207, ROC AUC 0.567. The
+all-No baseline accuracy is 0.887, so raw accuracy alone is misleading for
+this imbalanced dataset (about 11% Yes). Regression (301 test rows) gives
+small MAE 5.395, RMSE 7.080; medium MAE 5.776, RMSE 7.274. The training-mean
+baseline has MAE 5.648 and RMSE 6.978. The earlier 2 Yes/2 No context with a
+zero-logit threshold ignored class prevalence; a raw accuracy-tuned threshold
+instead predicted nearly all No. Both issues are addressed with the
+validation-only balanced threshold. Nearest-feature context improves small
+regression MAE, but medium regression and both classification models remain
+weak. Fixed three-feature, four-context-row core exports cannot recover the
+omitted features or emulate the public KumoTabular pipeline's larger context
+and preprocessing; the remaining gap is not evidence of a quantization bug.
