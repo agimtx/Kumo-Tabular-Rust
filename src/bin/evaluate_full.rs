@@ -291,6 +291,7 @@ fn evaluate(
     context_rows: usize,
     trace: bool,
     precision: &str,
+    model_override: Option<&str>,
 ) -> EvalResult<Value> {
     let classification = task == Task::Classification;
     let (path, target) = if classification {
@@ -304,14 +305,16 @@ fn evaluate(
             "scaled-sound-pressure",
         )
     };
-    let model = format!(
-        "models/kumo-tabular-{size}-{}-dynamic-{precision}.onnx",
-        if classification {
-            "classification"
-        } else {
-            "regression"
-        }
-    );
+    let model = model_override.map(str::to_owned).unwrap_or_else(|| {
+        format!(
+            "models/kumo-tabular-{size}-{}-dynamic-{precision}.onnx",
+            if classification {
+                "classification"
+            } else {
+                "regression"
+            }
+        )
+    });
     if !Path::new(&model).is_file() {
         return Err(format!(
             "missing new dynamic export: {model}; run updated GitHub Action first"
@@ -338,7 +341,10 @@ fn evaluate(
         return Err("unexpected ONNX tensor contract".into());
     }
     let mut validation_prepared = Vec::new();
-    eprintln!("[{task:?} {precision}] validation rows {}", validation.len());
+    eprintln!(
+        "[{task:?} {precision}] validation rows {}",
+        validation.len()
+    );
     let (validation_scores, _, validation_batches) = infer(
         &mut session,
         &features,
@@ -426,6 +432,7 @@ fn evaluate(
         "context_rows_per_batch": context_rows, "queries_per_batch": QUERIES,
         "context_strategy": "class-balanced-random" , "seed": seed, "fit_rows": fit.len(),
         "validation_rows": validation.len(), "test_rows": test.len(),
+        "validation_mae": if classification { None } else { Some(validation_truth.iter().zip(&validation_scores).map(|(y,p)| (y-p).abs()).sum::<f64>() / validation_truth.len() as f64) },
         "classification_threshold": cut, "prediction_seconds": elapsed, "test_predictions": predictions,
         "metrics": metrics}),
     )
@@ -439,6 +446,8 @@ fn main() -> EvalResult<()> {
     let mut trace = false;
     let mut task_filter = "both".to_owned();
     let mut precision_filter = "all".to_owned();
+    let mut model_override = None;
+    let mut report_override = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().ok_or("missing --seed value")?.parse()?,
@@ -448,8 +457,12 @@ fn main() -> EvalResult<()> {
             }
             "--trace" => trace = true,
             "--task" => task_filter = args.next().ok_or("missing --task value")?,
-            "--precision" => {
-                precision_filter = args.next().ok_or("missing --precision value")?
+            "--precision" => precision_filter = args.next().ok_or("missing --precision value")?,
+            "--model-path" => {
+                model_override = Some(args.next().ok_or("missing --model-path value")?)
+            }
+            "--report-path" => {
+                report_override = Some(args.next().ok_or("missing --report-path value")?)
             }
             _ => return Err(format!("unknown argument: {arg}").into()),
         }
@@ -464,7 +477,10 @@ fn main() -> EvalResult<()> {
         _ => return Err("size must be small, medium or both".into()),
     };
     let tasks: Vec<(&str, Task)> = match task_filter.as_str() {
-        "both" => vec![("classification", Task::Classification), ("regression", Task::Regression)],
+        "both" => vec![
+            ("classification", Task::Classification),
+            ("regression", Task::Regression),
+        ],
         "classification" => vec![("classification", Task::Classification)],
         "regression" => vec![("regression", Task::Regression)],
         _ => return Err("task must be classification, regression or both".into()),
@@ -476,28 +492,66 @@ fn main() -> EvalResult<()> {
         "int4" => vec!["int4"],
         _ => return Err("precision must be fp16, fp8, int4 or all".into()),
     };
+    if (model_override.is_some() || report_override.is_some())
+        && (sizes.len() != 1 || tasks.len() != 1 || precisions.len() != 1)
+    {
+        return Err("model/report overrides require one size, task and precision".into());
+    }
+    if model_override.is_some() != report_override.is_some() {
+        return Err("--model-path and --report-path must be provided together".into());
+    }
+    if let Some(model) = &model_override {
+        if !Path::new(model).is_file() {
+            return Err(format!("model override does not exist: {model}").into());
+        }
+    }
+    if let Some(model) = &model_override {
+        if !Path::new(model).is_file() {
+            return Err(format!("model override does not exist: {model}").into());
+        }
+    }
+    if let Some(model) = &model_override {
+        if !Path::new(model).is_file() {
+            return Err(format!("model override does not exist: {model}").into());
+        }
+    }
     for size in sizes {
         for precision in precisions.iter().copied() {
             let mut report = Vec::new();
             for &(name, task) in &tasks {
-                let model = format!("models/kumo-tabular-{size}-{name}-dynamic-{precision}.onnx");
+                let model = model_override.clone().unwrap_or_else(|| {
+                    format!("models/kumo-tabular-{size}-{name}-dynamic-{precision}.onnx")
+                });
                 if !Path::new(&model).is_file() {
                     continue;
                 }
-                report.push(evaluate(size, task, seed, context_rows, trace, precision)?);
+                report.push(evaluate(
+                    size,
+                    task,
+                    seed,
+                    context_rows,
+                    trace,
+                    precision,
+                    model_override.as_deref(),
+                )?);
             }
             if report.is_empty() {
                 continue;
             }
             for result in &report {
                 let task_name = result["task"].as_str().unwrap_or("unknown");
-                let path = if context_rows == DEFAULT_CONTEXT {
+                let path = if let Some(path) = &report_override {
+                    path.clone()
+                } else if context_rows == DEFAULT_CONTEXT {
                     format!("output/{size}-{task_name}-{precision}-full-evaluation-rust.json")
                 } else {
                     format!("output/{size}-{task_name}-{precision}-full-context-{context_rows}-evaluation-rust.json")
                 };
                 fs::create_dir_all("output")?;
-                fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&vec![result])?))?;
+                fs::write(
+                    &path,
+                    format!("{}\n", serde_json::to_string_pretty(&vec![result])?),
+                )?;
                 let metrics = &result["metrics"];
                 println!(
                     "{size} {task_name} {precision}: test_rows={} metrics={} report={path}",

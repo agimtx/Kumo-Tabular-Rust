@@ -46,7 +46,7 @@ The export script and workflow are described below. For external-data ONNX model
 
 ## Export ONNX
 
-In GitHub Actions, run **Export Kumo Tabular ONNX** manually and choose the model size, task, and weight precision (`fp16`, `fp8`, `int4`, or `all` to export all three). The workflow downloads the matching checkpoint from NVIDIA Kumo-Tabular and provides the `.onnx` file as a run artifact. Weights are stored in the selected low-precision format and converted to FP32 for computation; all three formats are lossy. INT4 quantizes only 2-D matrix weights with at least 4096 elements: each output channel gets its own symmetric scale, signed 4-bit values are packed two per byte, and the graph unpacks them with standard ONNX operators. Small vectors and scalars (biases, normalization weights, frequencies, attention scales) stay in FP32 because they are numerically sensitive and save negligible space. The exporter also repairs a legacy tracing bug in ICL attention key-length selection (`key.size(-3)`), validates all expected query-scaling paths, then stores the graph. This correction is required for correct context-dependent logits.
+In GitHub Actions, run **Export Kumo Tabular ONNX** manually and choose the model size, task, and weight precision (`fp16`, `fp8`, `int4`, or `all` to export all three). The workflow downloads the matching checkpoint from NVIDIA Kumo-Tabular and provides the `.onnx` file as a run artifact. Weights are stored in the selected low-precision format and converted to FP32 for computation; all three formats are lossy. INT4 quantizes only matrix weights with at least 4096 elements: regression uses a symmetric scale per 16 input channels when the final dimension is divisible by 16, while classification and non-divisible dimensions retain the original per-output-channel scale. Signed 4-bit values are packed two per byte and unpacked with standard ONNX operators. `--int4-group-size 0` restores per-output-channel scaling; other group widths can be specified explicitly. Small vectors and scalars (biases, normalization weights, frequencies, attention scales) stay in FP32. The 999-output regression head also stays in FP32: its previous row-wise INT4 relative L2 error of 0.423 collapsed the predicted median's spread. Classification and FP16/FP8 exports are unchanged. The exporter also repairs a legacy tracing bug in ICL attention key-length selection (`key.size(-3)`), validates all expected query-scaling paths, then stores the graph. This correction is required for correct context-dependent logits.
 
 Local export with an existing small classifier checkpoint:
 
@@ -252,11 +252,11 @@ Rust and Python use different recipe RNGs and arithmetic paths, although they
 receive the same context/query row indices. Prediction-level Pearson
 correlation and MAE are stored in the comparison JSON files.
 `scripts/check_quantized_weights.py` reconstructs every packed INT4 matrix from
-its nibbles and per-output-row scale and compares it with the original
-checkpoint; for the current medium exports the quantized tensors have mean
+its nibbles and per-group scale and compares it with the original
+checkpoint; for the original medium exports the quantized tensors have mean
 relative L2 error 0.143 (classification) / 0.146 (regression) and minimum
 cosine 0.962 / 0.909. Regression INT4 prediction correlation against `.pt`
-is 0.585, consistent with accumulated error across the 24-layer stack rather
+was 0.585, consistent with accumulated error across the 24-layer stack rather
 than a decode bug. The worst tensor is the final regression head,
 `icl_block.head.2.weight` (999×1024), at 0.423 relative L2 error; its
 per-output-row scale is set by each row's largest weight, so much of the
@@ -264,9 +264,56 @@ remaining row rounds to zero or ±1. That layer produces the 999 quantiles
 directly, which explains the collapsed median spread. The classification head
 (10×1024) has 0.275 relative error but only affects ten logits, so its ranking
 survives. Keeping the regression head in FP32 (or quantizing it more finely)
-is the obvious next export change; do not use the current INT4 regression
-model for accuracy-sensitive work. Rust reports include held-out predictions
+has now been applied; the original INT4 regression model and comparison reports
+remain as historical baselines. Rust reports include held-out predictions
 and are task/precision-specific.
+
+The earlier head-only INT4 regression export retained only `icl_block.head.2.weight` in
+FP32 (220 other matrices remain INT4). With medium / seed 42 / 32 context rows,
+the same 301 test rows give MAE 3.5650, RMSE 4.7137 and R2 0.5410, versus
+5.2782 / 6.4807 / 0.1324 for the original INT4 export. Prediction correlation
+against the cached official `.pt` replay rises from 0.5851 to 0.9062 and test
+prediction standard deviation from 1.392 to 5.222 (FP16: 5.987). The new
+model is 44.25 MB versus 40.68 MB for the original. An experimental variant
+also retaining the first five ICL attention output projections reached
+3.5263 / 4.6609 / 0.5512 at 48.82 MB; this marginal gain did not justify
+adding those FP32 weights to the default export. Candidate models and reports
+are stored in `models/` and `output/` (both ignored by Git). This diagnostic
+ablation reused the existing holdout, so the chosen mixed-precision policy
+needs evaluation on a new split before deployment accuracy claims.
+
+The next export revision uses 16-input-channel INT4 groups for regression in
+addition to retaining the FP32 head. Grouped scaling reduces relative L2 error
+in `icl_block.layers.0.attn.out_lin.weight` from 0.2664 to 0.0846. The same
+medium / seed 42 / 32-context evaluation (301 test rows) gives:
+
+| Export | Validation MAE | Test MAE | Test RMSE | Test R2 | ONNX MB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Head FP32, per-output INT4 | - | 3.5650 | 4.7137 | 0.5410 | 44.25 |
+| Head FP32, INT4 group 64 | 3.6383 | 3.3078 | 4.4345 | 0.5938 | 48.02 |
+| Head FP32, INT4 group 32 | 3.6188 | 3.2030 | 4.3082 | 0.6166 | 52.27 |
+| Head FP32, INT4 group 16 (default) | 3.2073 | 3.0328 | 4.0186 | 0.6664 | 60.77 |
+| Head FP32, INT4 group 8 | 3.2934 | 3.0102 | 3.9505 | 0.6776 | 77.76 |
+
+Group 16 has the best validation MAE among the tested widths and remains
+smaller than the 73.91 MB FP8 model. The group-8 test improvement does not
+outweigh its worse validation MAE and larger size. These widths were explored
+using the same held-out split, so the test numbers are descriptive, **not an
+independent estimate after model selection**. A fresh split or dataset is
+needed to confirm generalization. Reports and candidate models are in the
+ignored `output/` and `models/` directories, respectively.
+
+To rerun the grouped candidate without overwriting the old INT4 report:
+
+```sh
+OMP_NUM_THREADS=4 .venv-official/bin/python scripts/export_onnx.py \
+  --size medium --task regression --quantization int4 --checkpoint pt/regressor.pt \
+  --output models/kumo-tabular-medium-regression-dynamic-int4-default-g16.onnx
+ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib target/release/evaluate_full \
+  --seed 42 --size medium --task regression --precision int4 --context-rows 32 \
+  --model-path models/kumo-tabular-medium-regression-dynamic-int4-default-g16.onnx \
+  --report-path output/medium-regression-int4-default-g16-full-evaluation-rust.json
+```
 
 Run all Rust reports (DuckDB CLI, ONNX Runtime dynamic library, and the six
 medium ONNX models are required), then run the original `.pt` comparison for

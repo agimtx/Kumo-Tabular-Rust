@@ -1,7 +1,7 @@
 """Compare dequantized ONNX initializers with the original PyTorch checkpoint.
 
-Every INT4 matrix is reconstructed from its packed nibbles and per-output-row
-scale.  Named initializers are matched to the FP32 state dict by key; the
+Every INT4 matrix is reconstructed from its packed nibbles and per-group
+scales.  Named initializers are matched to the FP32 state dict by key; the
 anonymous ``onnx::MatMul_*`` tensors are matched by shape and dequantized-value
 similarity.  The FP16 export is a lossless reference for all remaining
 tensors, so coverage and per-layer error can be reported for the whole model.
@@ -23,21 +23,23 @@ TASKS = {
 }
 HELPERS = (
     "_scale", "_shape", "_flat_shape", "_slice_start", "_slice_end",
-    "_slice_axis", "_slice_step", "_indices",
+    "_slice_axis", "_slice_step", "_indices", "_group_shape",
 )
 
 
-def decode_int4(packed: np.ndarray, scale: np.ndarray, size: int) -> np.ndarray:
+def decode_int4(packed: np.ndarray, scale: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
     nibbles = np.empty(packed.size * 2, dtype=np.int8)
     nibbles[0::2] = (packed & 0x0F).astype(np.int8)
     nibbles[1::2] = (packed >> 4).astype(np.int8)
     nibbles[nibbles >= 8] -= 16
-    quantized = nibbles[:size].astype(np.float64)
-    rows = int(scale.size)
-    if rows <= 0 or size % rows:
-        raise ValueError(f"cannot reshape {size} values into {rows} rows")
-    values = quantized.reshape(rows, size // rows) * scale.reshape(rows, 1)
-    return values.astype(np.float32)
+    size = int(np.prod(shape))
+    groups = scale.size // int(np.prod(shape[:-1]))
+    if groups <= 0 or shape[-1] % groups:
+        raise ValueError(f"cannot group shape {shape} into {groups} groups")
+    grouped = shape[:-1] + (groups, shape[-1] // groups)
+    values = (nibbles[:size].astype(np.float64).reshape(grouped)
+              * scale.reshape(shape[:-1] + (groups, 1)))
+    return values.reshape(shape).astype(np.float32)
 
 
 def decode_fp8(indices: np.ndarray) -> np.ndarray:
@@ -59,8 +61,7 @@ def load_onnx_weights(path: Path) -> tuple[dict[str, np.ndarray], dict[str, bool
             base = name[: -len("_int4_packed_uint8")]
             scale = numpy_helper.to_array(initializers[base + "_scale"]).astype(np.float64)
             shape = numpy_helper.to_array(initializers[base + "_shape"])
-            size = int(np.prod(shape))
-            arrays[base] = decode_int4(numpy_helper.to_array(init), scale, size)
+            arrays[base] = decode_int4(numpy_helper.to_array(init), scale, tuple(shape))
             quantized[base] = True
         elif name.endswith("_fp8_uint8"):
             base = name[: -len("_fp8_uint8")]

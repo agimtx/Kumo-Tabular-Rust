@@ -177,18 +177,39 @@ def fix_sdpa_key_length_gathers(graph: onnx.ModelProto, size: str) -> None:
 
 
 INT4_MIN_MATRIX_ELEMENTS = 4096
+REGRESSION_HEAD_WEIGHT = "model.icl_block.head.2.weight"
 
 
-def quantize_int4(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Symmetrically quantize each output channel along the final axis."""
+def keep_int4_weight_fp32(name: str, task: str) -> bool:
+    """Keep the regression quantile projection exact in an INT4 export."""
+    return task == "regression" and name == REGRESSION_HEAD_WEIGHT
+
+
+def int4_group_size_for_task(task: str, requested: int | None) -> int:
+    """Use finer groups for regression without changing classification exports."""
+    if requested is not None and requested < 0:
+        raise ValueError("group_size must be nonnegative")
+    return requested if requested is not None else (16 if task == "regression" else 0)
+
+
+def quantize_int4(values: np.ndarray, group_size: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """Symmetrically quantize each output channel, optionally in input groups."""
     source = np.asarray(values, dtype=np.float32)
     if source.ndim < 2:
         raise ValueError("INT4 is only used for matrix weights")
-    rows = source.reshape(-1, source.shape[-1]).astype(np.float64)
+    if group_size < 0:
+        raise ValueError("group_size must be nonnegative")
+    width = (
+        group_size if group_size and source.shape[-1] % group_size == 0
+        else source.shape[-1]
+    )
+    rows = source.reshape(-1, width).astype(np.float64)
     maxima = np.max(np.abs(rows), axis=-1)
     scales = np.where(maxima > 0, maxima / 7.0, 1.0).astype(np.float32)
     quantized = np.clip(np.rint(rows / scales[:, None]), -8, 7).astype(np.int8)
-    return quantized.reshape(source.shape), scales.reshape(source.shape[:-1])
+    groups = source.shape[-1] // width
+    scale_shape = source.shape[:-1] + ((groups,) if groups > 1 else ())
+    return quantized.reshape(source.shape), scales.reshape(scale_shape)
 
 
 def pack_int4(values: np.ndarray) -> np.ndarray:
@@ -210,8 +231,10 @@ def unpack_int4(values: np.ndarray, count: int) -> np.ndarray:
     return nibbles[:count]
 
 
-def export(checkpoint: Path, output: Path, size: str, task: str, quantization: str) -> None:
+def export(checkpoint: Path, output: Path, size: str, task: str, quantization: str,
+           int4_group_size: int | None = None) -> None:
     classifier = task == "classification"
+    group_size = int4_group_size_for_task(task, int4_group_size) if quantization == "int4" else 0
     model = _KumoTabular(
         num_classes=10 if classifier else 0,
         num_quantiles=0 if classifier else 999,
@@ -286,10 +309,14 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                 compressed = numpy_helper.from_array(
                     encoded, name=name + "_fp8_uint8"
                 )
+            elif quantization == "int4" and keep_int4_weight_fp32(name, task):
+                if values.ndim != 2 or values.shape[0] != 999:
+                    raise ValueError(f"unexpected regression head shape: {values.shape}")
+                continue
             elif quantization == "int4" and values.ndim >= 2 and values.size >= INT4_MIN_MATRIX_ELEMENTS:
                 if not np.isfinite(values).all():
                     raise ValueError(f"non-finite weight values in {name}")
-                quantized, scales = quantize_int4(values)
+                quantized, scales = quantize_int4(values, group_size)
                 encoded = pack_int4(quantized)
                 compressed = numpy_helper.from_array(encoded, name=name + "_int4_packed_uint8")
             elif quantization == "int4":
@@ -311,13 +338,16 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                 ))
             elif quantization == "int4":
                 shape = np.asarray(values.shape, dtype=np.int64)
+                groups = scales.size // int(np.prod(values.shape[:-1]))
+                group_shape = values.shape[:-1] + (groups, values.shape[-1] // groups)
                 flat_name = name + "_int4_flat"
                 sliced_name = name + "_int4_unpadded"
                 gathered_name = name + "_int4_pairs"
                 indices_name = name + "_int4_indices"
                 graph.graph.initializer.extend((
                     numpy_helper.from_array(
-                        scales.reshape(values.shape[:-1] + (1,)), name=name + "_scale"
+                        scales.reshape(group_shape[:-1] + (1,) if groups > 1 else values.shape[:-1] + (1,)),
+                        name=name + "_scale",
                     ),
                     numpy_helper.from_array(np.asarray([-1], dtype=np.int64), name=name + "_flat_shape"),
                     numpy_helper.from_array(np.asarray([0], dtype=np.int64), name=name + "_slice_start"),
@@ -326,6 +356,10 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                     numpy_helper.from_array(np.asarray([1], dtype=np.int64), name=name + "_slice_step"),
                     numpy_helper.from_array(shape, name=name + "_shape"),
                 ))
+                if groups > 1:
+                    graph.graph.initializer.append(numpy_helper.from_array(
+                        np.asarray(group_shape, dtype=np.int64), name=name + "_group_shape"
+                    ))
                 casts.extend((
                     onnx.helper.make_node(
                         "Cast", [compressed.name], [indices_name],
@@ -345,14 +379,21 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                         name=name + "_int4_remove_padding",
                     ),
                     onnx.helper.make_node(
-                        "Reshape", [sliced_name, name + "_shape"], [name + "_int4_values"],
+                        "Reshape", [sliced_name, name + ("_group_shape" if groups > 1 else "_shape")],
+                        [name + "_int4_values"],
                         name=name + "_int4_restore_shape",
                     ),
                     onnx.helper.make_node(
-                        "Mul", [name + "_int4_values", name + "_scale"], [name],
+                        "Mul", [name + "_int4_values", name + "_scale"],
+                        [name + "_int4_group_values" if groups > 1 else name],
                         name=name + "_int4_dequantize",
                     ),
                 ))
+                if groups > 1:
+                    casts.append(onnx.helper.make_node(
+                        "Reshape", [name + "_int4_group_values", name + "_shape"], [name],
+                        name=name + "_int4_restore_matrix",
+                    ))
             else:
                 casts.append(onnx.helper.make_node(
                     "Cast", [compressed.name], [name], name=name + "_to_fp32",
@@ -400,8 +441,13 @@ def main() -> None:
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--int4-group-size", type=int,
+                        help="Input-channel group width (default: regression 16, classification 0; 0 uses per-output-channel scales)")
     args = parser.parse_args()
-    export(args.checkpoint, args.output, args.size, args.task, args.quantization)
+    if args.int4_group_size is not None and (args.int4_group_size < 0 or args.quantization != "int4"):
+        parser.error("--int4-group-size requires INT4 and a nonnegative group width")
+    export(args.checkpoint, args.output, args.size, args.task, args.quantization,
+           args.int4_group_size)
 
 
 if __name__ == "__main__":
