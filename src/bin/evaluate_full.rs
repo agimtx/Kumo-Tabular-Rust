@@ -1,4 +1,4 @@
-//! Full-feature Kumo evaluation using the dynamic FP16 core and the Rust recipe.
+//! Full-feature Kumo evaluation using the dynamic core and the Rust recipe.
 
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use serde_json::{json, Value};
@@ -14,6 +14,47 @@ type Dataset = (Vec<String>, Vec<Vec<Value>>, Vec<f64>);
 type BatchIndices = (Vec<usize>, Vec<usize>);
 const DEFAULT_CONTEXT: usize = 32;
 const QUERIES: usize = 2;
+
+#[derive(Clone, Default)]
+struct Latency {
+    samples: Vec<f64>,
+}
+
+impl Latency {
+    fn record(&mut self, seconds: f64) {
+        self.samples.push(seconds);
+    }
+
+    fn merged(&self, other: &Self) -> Self {
+        let mut samples = self.samples.clone();
+        samples.extend_from_slice(&other.samples);
+        Self { samples }
+    }
+
+    fn summary(&self) -> Value {
+        if self.samples.is_empty() {
+            return json!({"calls": 0});
+        }
+        let mut sorted = self.samples.clone();
+        sorted.sort_by(f64::total_cmp);
+        let calls = sorted.len();
+        let total = sorted.iter().sum::<f64>();
+        let percentile = |fraction: f64| {
+            let rank = (fraction * calls as f64).ceil() as usize;
+            sorted[rank.saturating_sub(1).min(calls - 1)] * 1000.0
+        };
+        json!({
+            "calls": calls,
+            "total_seconds": total,
+            "mean_ms": total / calls as f64 * 1000.0,
+            "median_ms": percentile(0.50),
+            "p95_ms": percentile(0.95),
+            "min_ms": sorted[0] * 1000.0,
+            "max_ms": sorted[calls - 1] * 1000.0,
+            "mean_ms_per_query": total / calls as f64 * 1000.0 / QUERIES as f64,
+        })
+    }
+}
 
 fn load_dataset(path: &str, target: &str) -> EvalResult<Dataset> {
     let command = Command::new("duckdb")
@@ -129,9 +170,10 @@ fn infer(
     seed: u64,
     context_rows: usize,
     trace_batches: Option<&mut Vec<Value>>,
-) -> EvalResult<(Vec<f64>, f64, Vec<BatchIndices>)> {
+) -> EvalResult<(Vec<f64>, f64, Vec<BatchIndices>, Latency)> {
     let mut rng = StdRng::seed_from_u64(seed);
     let start = Instant::now();
+    let mut latency = Latency::default();
     let mut predictions = Vec::with_capacity(queries.len());
     let mut batches = Vec::new();
     let mut trace_batches = trace_batches;
@@ -179,7 +221,12 @@ fn infer(
             task,
             &prepared.categorical_mask,
         )?;
-        let output = session.run_kumo(batch)?;
+        let output = {
+            let inference_start = Instant::now();
+            let output = session.run_kumo(batch)?;
+            latency.record(inference_start.elapsed().as_secs_f64());
+            output
+        };
         if let Some(trace) = trace_batches.as_deref_mut() {
             trace.push(json!({
                 "context_indices": context,
@@ -231,7 +278,7 @@ fn infer(
             }
         }
     }
-    Ok((predictions, start.elapsed().as_secs_f64(), batches))
+    Ok((predictions, start.elapsed().as_secs_f64(), batches, latency))
 }
 
 fn counts(truth: &[f64], scores: &[f64], threshold: f64) -> [usize; 4] {
@@ -345,7 +392,7 @@ fn evaluate(
         "[{task:?} {precision}] validation rows {}",
         validation.len()
     );
-    let (validation_scores, _, validation_batches) = infer(
+    let (validation_scores, _, validation_batches, validation_latency) = infer(
         &mut session,
         &features,
         &names_ref,
@@ -359,7 +406,7 @@ fn evaluate(
     )?;
     let mut test_prepared = Vec::new();
     eprintln!("[{task:?} {precision}] held-out rows {}", test.len());
-    let (predictions, elapsed, test_batches) = infer(
+    let (predictions, elapsed, test_batches, test_latency) = infer(
         &mut session,
         &features,
         &names_ref,
@@ -425,6 +472,7 @@ fn evaluate(
             "r2": 1.0-sq/truth.iter().map(|y| (y-mean).powi(2)).sum::<f64>(),
             "fit_mean_baseline_mae": truth.iter().map(|y| (y-train_mean).abs()).sum::<f64>() / truth.len() as f64});
     }
+    let combined_latency = validation_latency.merged(&test_latency);
     Ok(
         json!({"task": if classification { "classification" } else { "regression" },
         "engine": "rust-ort", "pipeline": "kumo-default-single-estimator", "precision": precision,
@@ -433,7 +481,13 @@ fn evaluate(
         "context_strategy": "class-balanced-random" , "seed": seed, "fit_rows": fit.len(),
         "validation_rows": validation.len(), "test_rows": test.len(),
         "validation_mae": if classification { None } else { Some(validation_truth.iter().zip(&validation_scores).map(|(y,p)| (y-p).abs()).sum::<f64>() / validation_truth.len() as f64) },
-        "classification_threshold": cut, "prediction_seconds": elapsed, "test_predictions": predictions,
+        "classification_threshold": cut, "prediction_seconds": elapsed,
+        "inference_latency": {
+            "validation": validation_latency.summary(),
+            "test": test_latency.summary(),
+            "combined": combined_latency.summary(),
+        },
+        "test_predictions": predictions,
         "metrics": metrics}),
     )
 }
@@ -505,16 +559,6 @@ fn main() -> EvalResult<()> {
             return Err(format!("model override does not exist: {model}").into());
         }
     }
-    if let Some(model) = &model_override {
-        if !Path::new(model).is_file() {
-            return Err(format!("model override does not exist: {model}").into());
-        }
-    }
-    if let Some(model) = &model_override {
-        if !Path::new(model).is_file() {
-            return Err(format!("model override does not exist: {model}").into());
-        }
-    }
     for size in sizes {
         for precision in precisions.iter().copied() {
             let mut report = Vec::new();
@@ -553,9 +597,16 @@ fn main() -> EvalResult<()> {
                     format!("{}\n", serde_json::to_string_pretty(&vec![result])?),
                 )?;
                 let metrics = &result["metrics"];
+                let latency = &result["inference_latency"]["test"];
                 println!(
-                    "{size} {task_name} {precision}: test_rows={} metrics={} report={path}",
-                    result["test_rows"], metrics
+                    "{size} {task_name} {precision} context={context_rows}: test_rows={} \
+                     mean={:.2}ms p95={:.2}ms median={:.2}ms total={:.2}s metrics={} report={path}",
+                    result["test_rows"],
+                    latency["mean_ms"].as_f64().unwrap_or_default(),
+                    latency["p95_ms"].as_f64().unwrap_or_default(),
+                    latency["median_ms"].as_f64().unwrap_or_default(),
+                    latency["total_seconds"].as_f64().unwrap_or_default(),
+                    metrics
                 );
             }
         }

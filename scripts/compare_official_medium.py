@@ -22,6 +22,28 @@ def note(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def latency_summary(samples: list[float]) -> dict:
+    if not samples:
+        return {"calls": 0}
+    values = np.sort(np.asarray(samples, dtype=np.float64))
+    count = len(values)
+
+    def percentile(fraction: float) -> float:
+        rank = max(1, min(count, int(math.ceil(fraction * count))))
+        return float(values[rank - 1] * 1000.0)
+
+    total = float(values.sum())
+    return {
+        "calls": count,
+        "total_seconds": total,
+        "mean_ms": total / count * 1000.0,
+        "median_ms": percentile(0.50),
+        "p95_ms": percentile(0.95),
+        "min_ms": float(values[0] * 1000.0),
+        "max_ms": float(values[-1] * 1000.0),
+    }
+
+
 def batches_fingerprint(trace: dict) -> str:
     digest = hashlib.sha256()
     for split in ("validation", "test"):
@@ -103,7 +125,9 @@ def main() -> None:
         "-official-predictions.json"
     )
     cached = json.loads(cache_path.read_text()) if cache_path.exists() else None
-    if cached is not None and cached.get("fingerprint") != fingerprint:
+    if cached is not None and (
+        cached.get("fingerprint") != fingerprint or "latency" not in cached
+    ):
         note(f"official predictions cache is stale for {args.task}; replaying")
         cached = None
     truth = dataframe[trace["target"]].to_numpy()
@@ -115,6 +139,7 @@ def main() -> None:
         cut = cached["classification_threshold"]
         metrics = cached["metrics"]
         elapsed = cached["evaluation_seconds"]
+        official_latency = cached.get("latency", {})
     else:
         stypes = {column: ("categorical" if pd.api.types.is_string_dtype(dataframe[column])
                              else "numerical") for column in trace["features"]}
@@ -122,6 +147,7 @@ def main() -> None:
         table = sdm.TableTensor.from_pandas(dataframe, stypes=stypes, device=args.device)
         note(f"loading official checkpoint and replaying batches for {args.task}")
         model = load_model(args.task, args.device)
+        timings = {"validation": [], "test": []}
 
         def predict(batches: list[dict], label: str) -> np.ndarray:
             predictions = []
@@ -129,6 +155,7 @@ def main() -> None:
                 context = table[batch["context"]]
                 query = table[batch["query"]]
                 generator = torch.Generator(device=args.device).manual_seed(args.seed + index)
+                call_start = time.perf_counter()
                 result = model(
                     x_context=context.drop_columns(trace["target"]),
                     y_context=context.select_columns([trace["target"]]),
@@ -136,6 +163,7 @@ def main() -> None:
                     num_estimators=1,
                     generator=generator,
                 )
+                timings[label].append(time.perf_counter() - call_start)
                 if args.task == "classification":
                     names = list(result.columns[sdm.Stype.numerical])
                     probabilities = result.numerical.detach().cpu().numpy()
@@ -152,6 +180,11 @@ def main() -> None:
         validation_predictions = predict(trace["validation_batches"], "validation")
         test_predictions = predict(trace["test_batches"], "test")
         elapsed = time.monotonic() - start
+        official_latency = {
+            "validation": latency_summary(timings["validation"]),
+            "test": latency_summary(timings["test"]),
+            "combined": latency_summary(timings["validation"] + timings["test"]),
+        }
         if args.task == "classification":
             validation_truth = (truth[trace["validation"]] == "Yes").astype(np.float64)
             test_truth = (truth[trace["test"]] == "Yes").astype(np.float64)
@@ -176,7 +209,7 @@ def main() -> None:
         cache_path.write_text(json.dumps({
             "fingerprint": fingerprint, "task": args.task, "context_rows": args.context_rows,
             "seed": args.seed, "classification_threshold": cut, "metrics": metrics,
-            "evaluation_seconds": elapsed,
+            "evaluation_seconds": elapsed, "latency": official_latency,
             "validation_predictions": validation_predictions.tolist(),
             "test_predictions": test_predictions.tolist(),
         }, indent=2) + "\n")
@@ -203,6 +236,8 @@ def main() -> None:
               "trace": str(trace_path), "rust_report": str(report_path),
               "context_rows": args.context_rows, "seed": args.seed,
               "num_estimators": 1, "device": args.device, "evaluation_seconds": elapsed,
+              "latency": official_latency,
+              "rust_latency": rust_report.get("inference_latency", {}).get("test"),
               "classification_threshold": cut, "metrics": metrics, "comparison_to_rust": comparison,
               "test_predictions": test_predictions.tolist(), "validation_predictions": validation_predictions.tolist()}
     suffix = "" if args.context_rows == 32 else f"-context-{args.context_rows}"

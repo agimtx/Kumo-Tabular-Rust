@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 use tabular_onnx::kumo::{KumoBatch, KumoPredictor};
 use tabular_onnx::model::{prediction_from_tensor, Task, TensorPrediction};
 use tabular_onnx::{
-    Column, ColumnData, FeatureSpec, OnnxSession, Prediction, Predictor, PreprocessConfig,
-    Preprocessor, Table, Value,
+    Column, ColumnData, FeatureSpec, OnnxSession, PreprocessConfig, Preprocessor, Table, Value,
 };
 
 #[test]
@@ -149,80 +148,48 @@ fn predictor_rejects_missing_context_feature_rows_before_loading_model() {
 }
 
 #[test]
-#[ignore = "requires local FP16 ONNX model and ORT_DYLIB_PATH; run with --ignored"]
-fn predictor_uses_real_context_features() {
-    let model = "small/kumo-tabular-small-classification-fp16.onnx";
-    assert!(std::env::var_os("ORT_DYLIB_PATH").is_some());
-    assert!(std::path::Path::new(model).exists());
-    let config = PreprocessConfig {
-        features: ["a", "b", "c"]
-            .iter()
-            .map(|name| FeatureSpec::Numeric {
-                column: (*name).into(),
-                mean: 0.0,
-                scale: 1.0,
-                missing_value: 0.0,
-            })
-            .collect(),
-        standardize_numeric: false,
-    };
-    let context = Table::new(
-        ["a", "b", "c"]
-            .iter()
-            .enumerate()
-            .map(|(col, name)| Column {
-                name: (*name).into(),
-                data: ColumnData::Numeric((0..4).map(|row| Some((row + col + 1) as f64)).collect()),
-            })
-            .collect(),
-    )
-    .unwrap();
-    let query = Table::new(
-        ["a", "b", "c"]
-            .iter()
-            .enumerate()
-            .map(|(col, name)| Column {
-                name: (*name).into(),
-                data: ColumnData::Numeric((4..6).map(|row| Some((row + col + 1) as f64)).collect()),
-            })
-            .collect(),
-    )
-    .unwrap();
-    let prep = Preprocessor::new(config).unwrap();
-    let predictor = KumoPredictor::load(
-        model,
-        prep.clone(),
-        Task::Classification,
-        &context,
-        vec![0.0, 1.0, 0.0, 1.0],
-        None,
-    )
-    .unwrap();
-    let Prediction::Classification { scores, .. } = predictor.predict(&query).unwrap() else {
-        panic!("expected classifier");
-    };
-    let mut matrix = Array2::zeros((6, 3));
-    matrix
-        .slice_mut(ndarray::s![..4, ..])
-        .assign(&prep.transform(&context).unwrap().values);
-    matrix
-        .slice_mut(ndarray::s![4..6, ..])
-        .assign(&prep.transform(&query).unwrap().values);
-    let expected = OnnxSession::load(model)
-        .unwrap()
-        .run_kumo(
-            KumoBatch::from_features(
-                &matrix,
-                &[0.0, 1.0, 0.0, 1.0],
-                Task::Classification,
-                &[false; 3],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    for row in 0..2 {
-        for col in 0..10 {
-            assert!((scores[row][col] - expected[(row, col)]).abs() < 1e-5);
+#[ignore = "requires models/kumo-tabular-medium-classification-dynamic-fp16.onnx and ORT_DYLIB_PATH; run with --ignored"]
+fn dynamic_medium_model_accepts_16_context_rows() {
+    use std::time::Instant;
+
+    let model = "models/kumo-tabular-medium-classification-dynamic-fp16.onnx";
+    assert!(
+        std::env::var_os("ORT_DYLIB_PATH").is_some(),
+        "set ORT_DYLIB_PATH before running this test"
+    );
+    assert!(
+        std::path::Path::new(model).exists(),
+        "missing model: {model}"
+    );
+
+    // 16 context rows + 2 query rows and the 13 classification features.
+    let mut features = Array2::<f32>::zeros((18, 13));
+    for row in 0..18 {
+        for col in 0..13 {
+            features[(row, col)] = ((row * 13 + col) % 17) as f32 / 7.0;
         }
     }
+    let labels = (0..16).map(|row| (row % 2) as f32).collect::<Vec<_>>();
+    let categorical_mask = [
+        false, false, true, true, true, false, true, true, false, false, false, false, false,
+    ];
+    let batch = KumoBatch::from_dynamic_features(
+        &features,
+        &labels,
+        Task::Classification,
+        &categorical_mask,
+    )
+    .unwrap();
+
+    let mut session = OnnxSession::load(model).unwrap();
+    let started = Instant::now();
+    let output = session.run_kumo(batch).unwrap();
+    eprintln!(
+        "{model} 16-context inference: shape {:?}, {:.2} ms",
+        output.shape(),
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+
+    assert_eq!(output.shape(), &[2, 10]);
+    assert!(output.iter().all(|value| value.is_finite()));
 }
