@@ -35,3 +35,50 @@ python scripts/export_onnx.py --size small --task classification \
 ## Validation
 
 Run `cargo test` to test table conversion, preprocessing, and model-contract handling.
+
+## FP16 and FP32 model dataset evaluation
+
+With the two local Parquet files and FP16/FP32 ONNX exports in place, make the
+DuckDB CLI and a compatible ONNX Runtime dynamic library available. The Rust
+CLI uses `OnnxSession` for inference; Python is not involved. For example, on
+this machine:
+
+```sh
+CARGO_HOME="$PWD/.cargo-home" \
+ORT_DYLIB_PATH=/opt/homebrew/Caskroom/miniconda/base/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntime.1.23.0.dylib \
+cargo run --offline --release --bin evaluate_quantized -- --seed 42
+```
+
+Use `--precision fp32` to evaluate only the unquantized models, or
+`--precision both` to compare FP16 and FP32 using identical splits and context
+samples. The default is `fp16`. Output defaults to
+`output/quantized-evaluation-rust.json`,
+`output/unquantized-evaluation-rust.json`, or
+`output/precision-comparison-rust.json`, respectively; override with
+`--output PATH`. To run the FP32 end-to-end Rust test explicitly with local
+models and `ORT_DYLIB_PATH` configured:
+
+```sh
+cargo test --bin evaluate_quantized fp32_models_evaluate_both_datasets -- --ignored
+```
+
+Set `ORT_DYLIB_PATH` to the ONNX Runtime shared library on your machine; the
+local `CARGO_HOME` and `--offline` flags are optional when Cargo can access its
+normal cache and registry. The CLI uses a fixed, stratified 80/20 train/test
+split for classification and a seeded 80/20
+split for regression. Only training labels are supplied as context; each model
+call uses four context rows and two held-out query rows. Since the exported graph
+only accepts three columns, the selected features are recorded in the JSON.
+Numeric features are standardized using training-set statistics. The binary
+classifier uses the first two raw logits (class 0 = No, class 1 = Yes), rather
+than treating the 10 output scores as probabilities. Regression predictions
+use the median of 999 output quantiles, reversing the context-label scaling.
+
+With seed 42, Rust classification (344 test rows) gave FP16 accuracy 0.485 and
+ROC AUC 0.543 versus FP32 accuracy 0.483 and ROC AUC 0.543. Predicting No for
+every row has accuracy 0.887. Rust regression (301 test rows) gave FP16 MAE
+6.2496 and RMSE 7.9871 versus FP32 MAE 6.2499 and RMSE 7.9873. The training-mean
+baseline MAE is 5.648 and RMSE is 6.978. These are limited-context,
+three-feature evaluations of the *core* exports, not estimates for the public
+KumoTabular pipeline with its full
+preprocessing and larger context windows.
