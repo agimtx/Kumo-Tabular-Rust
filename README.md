@@ -46,7 +46,7 @@ The export script and workflow are described below. For external-data ONNX model
 
 ## Export ONNX
 
-In GitHub Actions, run **Export Kumo Tabular ONNX** manually and choose `small`, `medium`, or `large` and either `classification` or `regression`. The workflow downloads the matching checkpoint from NVIDIA Kumo-Tabular, converts it with Python, stores model weights as FP16, and provides the `.onnx` file as a run artifact. The graph casts weights back to FP32 for computation. FP16 quantization is lossy. The exporter also repairs a legacy tracing bug in ICL attention key-length selection (`key.size(-3)`), validates all expected query-scaling paths, then stores the graph. This correction is required for correct context-dependent logits.
+In GitHub Actions, run **Export Kumo Tabular ONNX** manually and choose the model size, task, and weight precision (`fp16`, `fp8`, or `int4`). The workflow downloads the matching checkpoint from NVIDIA Kumo-Tabular and provides the `.onnx` file as a run artifact. Weights are stored in the selected low-precision format and converted to FP32 for computation; all three formats are lossy. INT4 uses symmetric per-tensor scaling with ONNX `DequantizeLinear`. The exporter also repairs a legacy tracing bug in ICL attention key-length selection (`key.size(-3)`), validates all expected query-scaling paths, then stores the graph. This correction is required for correct context-dependent logits.
 
 Local export with an existing small classifier checkpoint:
 

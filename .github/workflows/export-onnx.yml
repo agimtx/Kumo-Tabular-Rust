@@ -20,6 +20,15 @@ on:
         options:
           - classification
           - regression
+      quantization:
+        description: Weight storage precision
+        required: true
+        default: fp16
+        type: choice
+        options:
+          - fp16
+          - fp8
+          - int4
 
 permissions:
   contents: read
@@ -52,23 +61,25 @@ jobs:
         env:
           SIZE: ${{ inputs.size }}
           TASK: ${{ inputs.task }}
+          QUANTIZATION: ${{ inputs.quantization }}
         run: |
           if [ "$TASK" = classification ]; then file=classifier.pt; else file=regressor.pt; fi
           python scripts/export_onnx.py \
-            --size "$SIZE" --task "$TASK" \
+            --size "$SIZE" --task "$TASK" --quantization "$QUANTIZATION" \
             --checkpoint "checkpoints/${file}" \
-            --output "output/kumo-tabular-${SIZE}-${TASK}-dynamic-fp16.onnx"
+            --output "output/kumo-tabular-${SIZE}-${TASK}-dynamic-${QUANTIZATION}.onnx"
       - name: Validate dynamic input shapes with ONNX Runtime
         env:
           SIZE: ${{ inputs.size }}
           TASK: ${{ inputs.task }}
+          QUANTIZATION: ${{ inputs.quantization }}
         run: |
           python -m pip install onnxruntime numpy
           python scripts/validate_dynamic_onnx.py \
-            "output/kumo-tabular-${SIZE}-${TASK}-dynamic-fp16.onnx" --task "$TASK"
+            "output/kumo-tabular-${SIZE}-${TASK}-dynamic-${QUANTIZATION}.onnx" --task "$TASK"
       - uses: actions/upload-artifact@v4
         with:
-          name: kumo-tabular-${{ inputs.size }}-${{ inputs.task }}-fp16-onnx
+          name: kumo-tabular-${{ inputs.size }}-${{ inputs.task }}-${{ inputs.quantization }}-onnx
           path: output/
           if-no-files-found: error
           compression-level: 0

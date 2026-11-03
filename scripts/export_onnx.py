@@ -175,7 +175,16 @@ def fix_sdpa_key_length_gathers(graph: onnx.ModelProto, size: str) -> None:
         )
 
 
-def export(checkpoint: Path, output: Path, size: str, task: str) -> None:
+def encode_int4(values: np.ndarray) -> np.ndarray:
+    """Round signed values in [-8, 7] and pack them into ONNX INT4 nibbles."""
+    quantized = np.clip(np.rint(values), -8, 7).astype(np.int8).reshape(-1)
+    if quantized.size % 2:
+        quantized = np.pad(quantized, (0, 1))
+    nibbles = quantized.astype(np.uint8) & 0x0F
+    return nibbles[0::2] | (nibbles[1::2] << 4)
+
+
+def export(checkpoint: Path, output: Path, size: str, task: str, quantization: str) -> None:
     classifier = task == "classification"
     model = _KumoTabular(
         num_classes=10 if classifier else 0,
@@ -239,16 +248,56 @@ def export(checkpoint: Path, output: Path, size: str, task: str) -> None:
             if weight.data_type != TensorProto.FLOAT:
                 continue
             name = weight.name
-            half = numpy_helper.from_array(
-                numpy_helper.to_array(weight).astype("float16"), name=name + "_fp16"
-            )
-            weight.CopyFrom(half)
-            casts.append(
-                onnx.helper.make_node(
-                    "Cast", [half.name], [name], name=name + "_to_fp32",
+            values = numpy_helper.to_array(weight)
+            if quantization == "fp16":
+                compressed = numpy_helper.from_array(
+                    values.astype(np.float16), name=name + "_fp16"
+                )
+            elif quantization == "fp8":
+                encoded = np.fromiter(
+                    (
+                        onnx.helper.float32_to_float8e4m3(float(value), saturate=True)
+                        for value in values.astype(np.float32).reshape(-1)
+                    ),
+                    dtype=np.uint8,
+                    count=values.size,
+                ).reshape(values.shape)
+                compressed = onnx.helper.make_tensor(
+                    name=name + "_fp8", data_type=TensorProto.FLOAT8E4M3FN,
+                    dims=values.shape, vals=encoded.tobytes(), raw=True,
+                )
+            else:
+                scale = float(np.max(np.abs(values))) / 7.0
+                scale = scale if scale > 0 else 1.0
+                encoded = encode_int4(values / scale)
+                compressed = onnx.helper.make_tensor(
+                    name=name + "_int4", data_type=TensorProto.INT4,
+                    dims=values.shape, vals=encoded.tobytes(), raw=True,
+                )
+            weight.CopyFrom(compressed)
+            if quantization == "fp8":
+                cast = onnx.helper.make_node(
+                    "Cast", [compressed.name], [name], name=name + "_to_fp32",
                     to=TensorProto.FLOAT,
                 )
-            )
+                casts.append(cast)
+            elif quantization == "int4":
+                graph.graph.initializer.append(
+                    numpy_helper.from_array(np.asarray(scale, dtype=np.float32), name=name + "_scale")
+                )
+                graph.graph.initializer.append(
+                    numpy_helper.from_array(np.asarray(0, dtype=np.int8), name=name + "_zero_point")
+                )
+                casts.append(onnx.helper.make_node(
+                    "DequantizeLinear",
+                    [compressed.name, name + "_scale", name + "_zero_point"],
+                    [name], name=name + "_dequantize", axis=0,
+                ))
+            else:
+                casts.append(onnx.helper.make_node(
+                    "Cast", [compressed.name], [name], name=name + "_to_fp32",
+                    to=TensorProto.FLOAT,
+                ))
         for cast in reversed(casts):
             graph.graph.node.insert(0, cast)
         onnx.save_model(
@@ -260,7 +309,7 @@ def export(checkpoint: Path, output: Path, size: str, task: str) -> None:
             location=f"{output.name}.data",
         )
     onnx.checker.check_model(str(output))
-    print(f"Exported FP16 {task} {size} model to {output}")
+    print(f"Exported {quantization.upper()} {task} {size} model to {output}")
 
 
 def main() -> None:
@@ -269,10 +318,13 @@ def main() -> None:
     parser.add_argument(
         "--task", required=True, choices=("classification", "regression")
     )
+    parser.add_argument(
+        "--quantization", choices=("fp16", "fp8", "int4"), default="fp16"
+    )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    export(args.checkpoint, args.output, args.size, args.task)
+    export(args.checkpoint, args.output, args.size, args.task, args.quantization)
 
 
 if __name__ == "__main__":
