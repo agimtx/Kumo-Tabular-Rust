@@ -57,10 +57,10 @@ jobs:
           python scripts/export_onnx.py \
             --size "$SIZE" --task "$TASK" \
             --checkpoint "checkpoints/${file}" \
-            --output "output/kumo-tabular-${SIZE}-${TASK}.onnx"
+            --output "output/kumo-tabular-${SIZE}-${TASK}-fp16.onnx"
       - uses: actions/upload-artifact@v4
         with:
-          name: kumo-tabular-${{ inputs.size }}-${{ inputs.task }}-onnx
+          name: kumo-tabular-${{ inputs.size }}-${{ inputs.task }}-fp16-onnx
           path: output/
           if-no-files-found: error
           compression-level: 0

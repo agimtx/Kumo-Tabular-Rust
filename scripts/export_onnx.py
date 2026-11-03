@@ -2,9 +2,11 @@
 
 import argparse
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import onnx
 import torch
+from onnx import TensorProto, numpy_helper
 from torch.onnx import symbolic_helper
 from sdm.models.kumo.tabular.model import MODEL_KWARGS, _KumoTabular
 
@@ -80,30 +82,59 @@ def export(checkpoint: Path, output: Path, size: str, task: str) -> None:
     categorical_mask = torch.zeros(3, dtype=torch.bool)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    # The gradient-enabled branch avoids inference-only output buffers and
-    # chunking, which are not part of the mathematical forward pass.
-    with torch.enable_grad():
-        torch.onnx.register_custom_op_symbolic(
-            "aten::nanmean", export_nanmean, 17
-        )
-        torch.onnx.register_custom_op_symbolic(
-            "aten::mT", export_matrix_transpose, 17
-        )
-        torch.onnx.register_custom_op_symbolic(
-            "aten::rms_norm", export_rms_norm, 17
-        )
-        torch.onnx.export(
-            ExportableKumo(model),
-            (x, y, categorical_mask),
+    with TemporaryDirectory(dir=output.parent) as temporary_dir:
+        fp32_path = Path(temporary_dir) / "model-fp32.onnx"
+        # The gradient-enabled branch avoids inference-only output buffers and
+        # chunking, which are not part of the mathematical forward pass.
+        with torch.enable_grad():
+            torch.onnx.register_custom_op_symbolic(
+                "aten::nanmean", export_nanmean, 17
+            )
+            torch.onnx.register_custom_op_symbolic(
+                "aten::mT", export_matrix_transpose, 17
+            )
+            torch.onnx.register_custom_op_symbolic(
+                "aten::rms_norm", export_rms_norm, 17
+            )
+            torch.onnx.export(
+                ExportableKumo(model),
+                (x, y, categorical_mask),
+                str(fp32_path),
+                input_names=["x", "y", "categorical_mask"],
+                output_names=["predictions"],
+                opset_version=17,
+                dynamo=False,
+                verbose=False,
+            )
+        del model
+        graph = onnx.load(str(fp32_path))
+        casts = []
+        for weight in graph.graph.initializer:
+            if weight.data_type != TensorProto.FLOAT:
+                continue
+            name = weight.name
+            half = numpy_helper.from_array(
+                numpy_helper.to_array(weight).astype("float16"), name=name + "_fp16"
+            )
+            weight.CopyFrom(half)
+            casts.append(
+                onnx.helper.make_node(
+                    "Cast", [half.name], [name], name=name + "_to_fp32",
+                    to=TensorProto.FLOAT,
+                )
+            )
+        for cast in reversed(casts):
+            graph.graph.node.insert(0, cast)
+        onnx.save_model(
+            graph,
             str(output),
-            input_names=["x", "y", "categorical_mask"],
-            output_names=["predictions"],
-            opset_version=17,
-            dynamo=False,
-            verbose=False,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            size_threshold=1024 * 1024 * 1024,
+            location=f"{output.name}.data",
         )
     onnx.checker.check_model(str(output))
-    print(f"Exported {task} {size} model to {output}")
+    print(f"Exported FP16 {task} {size} model to {output}")
 
 
 def main() -> None:
