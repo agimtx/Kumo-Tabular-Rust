@@ -245,7 +245,7 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
         graph = onnx.load(str(fp32_path))
         fix_sdpa_key_length_gathers(graph, size)
         casts = []
-        for weight in graph.graph.initializer:
+        for weight in list(graph.graph.initializer):
             if weight.data_type != TensorProto.FLOAT:
                 continue
             name = weight.name
