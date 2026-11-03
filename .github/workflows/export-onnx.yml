@@ -29,6 +29,7 @@ on:
           - fp16
           - fp8
           - int4
+          - all
 
 permissions:
   contents: read
@@ -64,10 +65,14 @@ jobs:
           QUANTIZATION: ${{ inputs.quantization }}
         run: |
           if [ "$TASK" = classification ]; then file=classifier.pt; else file=regressor.pt; fi
-          python scripts/export_onnx.py \
-            --size "$SIZE" --task "$TASK" --quantization "$QUANTIZATION" \
-            --checkpoint "checkpoints/${file}" \
-            --output "output/kumo-tabular-${SIZE}-${TASK}-dynamic-${QUANTIZATION}.onnx"
+          mkdir -p output
+          if [ "$QUANTIZATION" = all ]; then quantizations="fp16 fp8 int4"; else quantizations="$QUANTIZATION"; fi
+          for quantization in $quantizations; do
+            python scripts/export_onnx.py \
+              --size "$SIZE" --task "$TASK" --quantization "$quantization" \
+              --checkpoint "checkpoints/${file}" \
+              --output "output/kumo-tabular-${SIZE}-${TASK}-dynamic-${quantization}.onnx"
+          done
       - name: Validate dynamic input shapes with ONNX Runtime
         env:
           SIZE: ${{ inputs.size }}
@@ -75,8 +80,11 @@ jobs:
           QUANTIZATION: ${{ inputs.quantization }}
         run: |
           python -m pip install onnxruntime numpy
-          python scripts/validate_dynamic_onnx.py \
-            "output/kumo-tabular-${SIZE}-${TASK}-dynamic-${QUANTIZATION}.onnx" --task "$TASK"
+          if [ "$QUANTIZATION" = all ]; then quantizations="fp16 fp8 int4"; else quantizations="$QUANTIZATION"; fi
+          for quantization in $quantizations; do
+            python scripts/validate_dynamic_onnx.py \
+              "output/kumo-tabular-${SIZE}-${TASK}-dynamic-${quantization}.onnx" --task "$TASK"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: kumo-tabular-${{ inputs.size }}-${{ inputs.task }}-${{ inputs.quantization }}-onnx
