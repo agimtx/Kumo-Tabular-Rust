@@ -1,25 +1,28 @@
 # Kumo-Tabular-Rust
 
+Rust library for extensible tabular preprocessing and ONNX Runtime inference. It currently includes a generic table/preprocessor pipeline, a named-tensor ONNX adapter, a model registry, and a validator for the fixed tensor contract of the Kumo ONNX exports in this repository. FFI is intentionally not part of this crate yet.
+
+## Rust API
+
+`Table` is a typed, nullable, column-oriented input model. It converts to and from Polars `DataFrame`; callers can also construct it from rows. Define a serializable `PreprocessConfig` alongside each trained model. Numeric features apply a missing-value replacement and optional standardization using persisted training statistics. Categorical features use a persisted category-to-code dictionary with explicit unknown and missing codes. Input feature order is the order in `PreprocessConfig::features`.
+
+`Predictor` is the extension point for a model family. Implementations own their preprocessing and tensor contracts, and return task-tagged `Prediction`s. `ModelRegistry` enables runtime registration by model name. `OnnxSession` is a low-level ORT session wrapper for named float32 tensor inputs; model adapters assemble model-specific inputs above it.
+
+## Kumo tensor contract
+
+The current exported graph is the core network, not the public `KumoTabular` wrapper:
+
+- Inputs are `x: float32[6, 3]`, `y: int64[4]` for classification or `float32[4]` for regression, and `categorical_mask: bool[3]`.
+- Rows 0..4 provide context labels; rows 4..6 are the two query predictions.
+- Classification output is 10 raw ECOC scores, not decoded class probabilities.
+- Regression output contains 999 quantiles.
+- The export has fixed example dimensions. The adapter validates these constraints; a differently shaped export requires a separate model contract/configuration.
+
+The export script and workflow are described below. For external-data ONNX models, keep the generated `.onnx.data` file beside its model.
+
 ## Export ONNX
 
-In GitHub Actions, run **Export Kumo Tabular ONNX** manually and choose
-`small`, `medium`, or `large` and either `classification` or `regression`.
-The workflow downloads the matching checkpoint from
-[NVIDIA Kumo-Tabular](https://huggingface.co/nvidia/Kumo-Tabular), converts it
-with Python, stores the model weights as FP16, and provides the `.onnx` file as
-a run artifact. The graph casts the weights back to FP32 for computation, so
-the float32 inputs and outputs remain unchanged. FP16 quantization is lossy.
-
-The exported graph is the core Kumo Tabular network, **not** the public
-`KumoTabular` inference wrapper. It takes `x` (6 rows by 3 numerical features),
-`y` (4 labeled context rows), and `categorical_mask` (3 boolean values).
-The last 2 rows are queries. For classification, `y` is int64 with class codes
-0 through 9 and the output contains 10 raw scores per query; the public API's
-ECOC class-probability decoding is not included. For regression, `y` is float32
-and the output has 999 quantiles per query. This export uses fixed example
-shapes; other row or feature counts require exporting with new example inputs.
-For models exceeding ONNX's 2 GB limit, the artifact also contains external
-weight data that must remain beside the `.onnx` file.
+In GitHub Actions, run **Export Kumo Tabular ONNX** manually and choose `small`, `medium`, or `large` and either `classification` or `regression`. The workflow downloads the matching checkpoint from NVIDIA Kumo-Tabular, converts it with Python, stores model weights as FP16, and provides the `.onnx` file as a run artifact. The graph casts weights back to FP32 for computation. FP16 quantization is lossy.
 
 Local export with an existing small classifier checkpoint:
 
@@ -28,3 +31,7 @@ python -m pip install 'torch>=2.7' structured-data-models onnx
 python scripts/export_onnx.py --size small --task classification \
   --checkpoint smail/classifier.pt --output output/kumo-tabular-small-classification-fp16.onnx
 ```
+
+## Validation
+
+Run `cargo test` to test table conversion, preprocessing, and model-contract handling.
