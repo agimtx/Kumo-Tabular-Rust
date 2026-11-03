@@ -6,7 +6,7 @@ Rust library for extensible tabular preprocessing and ONNX Runtime inference. It
 
 `Table` is a typed, nullable, column-oriented input model. It converts to and from Polars `DataFrame`; callers can also construct it from rows. Define a serializable `PreprocessConfig` alongside each trained model. Numeric features apply a missing-value replacement and optional standardization using persisted training statistics. Categorical features use a persisted category-to-code dictionary with explicit unknown and missing codes. Input feature order is the order in `PreprocessConfig::features`.
 
-`Predictor` is the extension point for a model family. Implementations own their preprocessing and tensor contracts, and return task-tagged `Prediction`s. `ModelRegistry` enables runtime registration by model name. `OnnxSession` is a low-level ORT session wrapper for named float32 tensor inputs; model adapters assemble model-specific inputs above it.
+`Predictor` is the extension point for a model family. Implementations own their preprocessing and tensor contracts, and return task-tagged `Prediction`s. `ModelRegistry` enables runtime registration by model name. `OnnxSession` is a low-level ORT session wrapper for named float32 tensor inputs; model adapters assemble model-specific inputs above it. `KumoPredictor::load` requires the four context feature rows alongside their four labels; the model cannot infer from context labels paired with zero-filled features.
 
 ## Kumo tensor contract
 
@@ -14,9 +14,33 @@ The current exported graph is the core network, not the public `KumoTabular` wra
 
 - Inputs are `x: float32[6, 3]`, `y: int64[4]` for classification or `float32[4]` for regression, and `categorical_mask: bool[3]`.
 - Rows 0..4 provide context labels; rows 4..6 are the two query predictions.
-- Classification output is 10 raw ECOC scores, not decoded class probabilities.
+- Classification output is 10 raw class logits (the ECOC wrapper only handles targets with more than 10 classes), not decoded class probabilities.
 - Regression output contains 999 quantiles.
 - The export has fixed example dimensions. The adapter validates these constraints; a differently shaped export requires a separate model contract/configuration.
+
+### Difference from the public Python predictor
+
+The Python `KumoTabular` public predictor fits a recipe on each supplied
+context table and transforms queries using the fitted recipe. Its default
+recipe handles numerical and categorical columns separately, drops constant
+columns, standardizes and clips numeric values, applies alternative nonlinear
+transforms and random sign flips, shuffles/selects columns, transforms targets,
+then aggregates multiple estimators. Classification applies softmax to the
+class logits (the ECOC wrapper only remaps codes above ten classes), while
+regression sorts quantiles and inverts the target transform. The ONNX export
+calls the internal `_KumoTabular` directly and contains **none** of that
+recipe. Its fixed `[6,3]` input and four context labels also prevent feeding
+the full table or a realistic context set. `KumoBatch` also currently rejects
+NaNs even though the Python model handles missing cells. The Rust evaluator is therefore a
+limited core-network experiment, not a parity test with Python `predict`.
+Simply applying a per-batch four-row standardization was checked against a
+training-only validation set and was not selected for any of the four tasks;
+it cannot substitute for the full recipe. To test public-predictor accuracy,
+export a graph supporting variable context/query sizes and feature counts and
+implement the full recipe, or evaluate the Python public predictor separately.
+Source: [Kumo model](https://github.com/NVIDIA/structured-data-models/blob/main/sdm/models/kumo/tabular/model.py),
+[default recipe](https://github.com/NVIDIA/structured-data-models/blob/main/sdm/models/kumo/tabular/recipe.py),
+[ICLModel](https://github.com/NVIDIA/structured-data-models/blob/main/sdm/models/base/icl.py).
 
 The export script and workflow are described below. For external-data ONNX models, keep the generated `.onnx.data` file beside its model.
 
@@ -89,3 +113,48 @@ regression MAE, but medium regression and both classification models remain
 weak. Fixed three-feature, four-context-row core exports cannot recover the
 omitted features or emulate the public KumoTabular pipeline's larger context
 and preprocessing; the remaining gap is not evidence of a quantization bug.
+
+## Full-feature Rust evaluation (new dynamic exports required)
+
+The separate `evaluate_full` binary consumes **new** `*-dynamic-fp16.onnx`
+models and never reuses the old fixed-shape reports. Run the updated
+**Export Kumo Tabular ONNX** GitHub Action four times: `small`/`medium` times
+`classification`/`regression`. Each run downloads NVIDIA's `v1.0.1`
+checkpoint, exports variable-length context/query rows and feature columns,
+and validates two distinct shapes through ONNX Runtime before uploading the
+artifact. Put each artifact's ONNX file at its corresponding path:
+
+```text
+small/kumo-tabular-small-classification-dynamic-fp16.onnx
+small/kumo-tabular-small-regression-dynamic-fp16.onnx
+medium/kumo-tabular-medium-classification-dynamic-fp16.onnx
+medium/kumo-tabular-medium-regression-dynamic-fp16.onnx
+```
+
+Then run Rust inference (DuckDB CLI and `ORT_DYLIB_PATH` are required):
+
+```sh
+CARGO_HOME="$PWD/.cargo-home" \
+ORT_DYLIB_PATH=/opt/homebrew/Caskroom/miniconda/base/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntime.1.23.0.dylib \
+cargo run --locked --offline --release --bin evaluate_full -- --seed 42 --size both
+```
+
+This reads every non-target column: 13 features (including categorical
+columns) in customer classification and 5 numerical features in airfoil
+regression. Each inference uses 32 fitted context examples and up to 2 query
+rows. The Rust recipe fits numeric statistics and category vocabularies on
+context rows, drops constants, standardizes/clips, handles high-cardinality
+counts, applies the default one-estimator identity option and fitted sigma
+clipping, sign/category shifts, column permutation, and inverse target
+transforms. Classification's logit difference is used for ROC AUC and a
+validation-only balanced-accuracy threshold; regression uses sorted quantile
+median. The public Kumo API defaults to one estimator for two-dimensional
+inputs; multi-estimator output aggregation and the remaining nonlinear recipe
+options are **not implemented** here. Rust and PyTorch random generators also
+do not produce identical permutations from the same seed. This is an
+all-feature Rust implementation of the default single-estimator route, **not
+bit-for-bit Python predictor parity**. Its new results will be written to
+`output/small-full-evaluation-rust.json` and
+`output/medium-full-evaluation-rust.json` only after the new models arrive.
+Until then, the existing JSON reports above refer exclusively to the old
+fixed `[6,3]` graphs; no new full-feature accuracy has been measured.

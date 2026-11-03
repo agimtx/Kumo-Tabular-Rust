@@ -119,13 +119,13 @@ def export(checkpoint: Path, output: Path, size: str, task: str) -> None:
     model.eval()
 
     # The public KumoTabular classifier also runs ECOC outside this core network.
-    x = torch.randn(6, 3, dtype=torch.float32)
+    x = torch.randn(34, 13 if classifier else 5, dtype=torch.float32)
     y = (
-        torch.tensor([0, 1, 0, 1], dtype=torch.int64)
+        torch.tensor([0, 1] * 16, dtype=torch.int64)
         if classifier
-        else torch.randn(4)
+        else torch.randn(32)
     )
-    categorical_mask = torch.zeros(3, dtype=torch.bool)
+    categorical_mask = torch.zeros(x.size(1), dtype=torch.bool)
     output.parent.mkdir(parents=True, exist_ok=True)
 
     with TemporaryDirectory(dir=output.parent) as temporary_dir:
@@ -152,6 +152,12 @@ def export(checkpoint: Path, output: Path, size: str, task: str) -> None:
                 str(fp32_path),
                 input_names=["x", "y", "categorical_mask"],
                 output_names=["predictions"],
+                dynamic_axes={
+                    "x": {0: "total_rows", 1: "features"},
+                    "y": {0: "context_rows"},
+                    "categorical_mask": {0: "features"},
+                    "predictions": {0: "query_rows"},
+                },
                 opset_version=17,
                 dynamo=False,
                 verbose=False,

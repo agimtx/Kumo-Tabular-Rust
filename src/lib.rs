@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod kumo;
+pub mod kumo_recipe;
 pub mod model;
 pub mod onnx;
 pub mod preprocess;

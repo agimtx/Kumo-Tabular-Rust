@@ -17,6 +17,64 @@ pub struct KumoBatch {
 }
 
 impl KumoBatch {
+    /// Build an in-context batch for dynamic exports; missing feature cells remain NaN.
+    pub fn from_dynamic_features(
+        features: &Array2<f32>,
+        labels: &[f32],
+        task: Task,
+        categorical_mask: &[bool],
+    ) -> Result<Self> {
+        if labels.is_empty() || features.nrows() <= labels.len() || features.ncols() == 0 {
+            return Err(Error::Preprocessing(
+                "Kumo needs context rows, query rows and features".into(),
+            ));
+        }
+        if categorical_mask.len() != features.ncols() {
+            return Err(Error::Preprocessing(
+                "Kumo categorical mask must match feature width".into(),
+            ));
+        }
+        if features.iter().any(|value| value.is_infinite()) {
+            return Err(Error::Preprocessing(
+                "Kumo x contains infinite values".into(),
+            ));
+        }
+        let (y_classification, y_regression) = match task {
+            Task::Classification => {
+                let labels = labels
+                    .iter()
+                    .map(|&label| {
+                        if !label.is_finite()
+                            || !(0.0..=9.0).contains(&label)
+                            || label.fract() != 0.0
+                        {
+                            return Err(Error::Preprocessing(
+                                "Kumo classification labels must be integer codes 0 through 9"
+                                    .into(),
+                            ));
+                        }
+                        Ok(label as i64)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (Some(Array1::from(labels)), None)
+            }
+            Task::Regression => {
+                if labels.iter().any(|label| !label.is_finite()) {
+                    return Err(Error::Preprocessing(
+                        "Kumo regression labels must be finite".into(),
+                    ));
+                }
+                (None, Some(Array1::from(labels.to_vec())))
+            }
+        };
+        Ok(Self {
+            x: features.clone(),
+            y_classification,
+            y_regression,
+            categorical_mask: Array1::from(categorical_mask.to_vec()),
+        })
+    }
+
     pub fn from_features(
         features: &Array2<f32>,
         labels: &[f32],
@@ -84,6 +142,7 @@ pub struct KumoPredictor {
     session: Mutex<OnnxSession>,
     preprocessor: Preprocessor,
     task: Task,
+    context_features: Array2<f32>,
     context_labels: Vec<f32>,
     labels: Option<Vec<String>>,
 }
@@ -93,6 +152,7 @@ impl KumoPredictor {
         model_path: impl AsRef<Path>,
         preprocessor: Preprocessor,
         task: Task,
+        context_table: &Table,
         context_labels: Vec<f32>,
         labels: Option<Vec<String>>,
     ) -> Result<Self> {
@@ -106,10 +166,17 @@ impl KumoPredictor {
                 "current Kumo export requires exactly 3 configured features".into(),
             ));
         }
+        if context_table.height != 4 {
+            return Err(Error::Model(
+                "current Kumo export requires exactly 4 context feature rows".into(),
+            ));
+        }
+        let context_features = preprocessor.transform(context_table)?.values;
         Ok(Self {
             session: Mutex::new(OnnxSession::load(model_path)?),
             preprocessor,
             task,
+            context_features,
             context_labels,
             labels,
         })
@@ -132,6 +199,8 @@ impl Predictor for KumoPredictor {
         }
         let transformed = self.preprocessor.transform(table)?;
         let mut x = Array2::zeros((6, 3));
+        x.slice_mut(ndarray::s![..4, ..])
+            .assign(&self.context_features);
         x.slice_mut(ndarray::s![4..6, ..])
             .assign(&transformed.values);
         if transformed.categorical_mask.len() != 3 {
