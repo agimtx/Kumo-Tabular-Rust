@@ -128,11 +128,13 @@ fn infer(
     task: Task,
     seed: u64,
     context_rows: usize,
+    trace_batches: Option<&mut Vec<Value>>,
 ) -> EvalResult<(Vec<f64>, f64, Vec<BatchIndices>)> {
     let mut rng = StdRng::seed_from_u64(seed);
     let start = Instant::now();
     let mut predictions = Vec::with_capacity(queries.len());
     let mut batches = Vec::new();
+    let mut trace_batches = trace_batches;
     for query in queries.chunks(QUERIES) {
         let mut context = if task == Task::Classification {
             [0.0, 1.0]
@@ -178,6 +180,20 @@ fn infer(
             &prepared.categorical_mask,
         )?;
         let output = session.run_kumo(batch)?;
+        if let Some(trace) = trace_batches.as_deref_mut() {
+            trace.push(json!({
+                "context_indices": context,
+                "query_indices": query,
+                "x": prepared.x.rows().into_iter().map(|row| row.to_vec()).collect::<Vec<_>>(),
+                "y": prepared.labels,
+                "categorical_mask": prepared.categorical_mask,
+                "class_permutation": prepared.class_permutation,
+                "target_center": prepared.target_center,
+                "target_scale": prepared.target_scale,
+                "target_sign": prepared.target_sign,
+                "rust_output": output.rows().into_iter().map(|row| row.to_vec()).collect::<Vec<_>>(),
+            }));
+        }
         if output.nrows() != query.len()
             || output.ncols()
                 != if task == Task::Classification {
@@ -318,6 +334,7 @@ fn evaluate(
     {
         return Err("unexpected ONNX tensor contract".into());
     }
+    let mut validation_prepared = Vec::new();
     let (validation_scores, _, validation_batches) = infer(
         &mut session,
         &features,
@@ -328,7 +345,9 @@ fn evaluate(
         task,
         seed,
         context_rows,
+        trace.then_some(&mut validation_prepared),
     )?;
+    let mut test_prepared = Vec::new();
     let (predictions, elapsed, test_batches) = infer(
         &mut session,
         &features,
@@ -339,6 +358,7 @@ fn evaluate(
         task,
         seed,
         context_rows,
+        trace.then_some(&mut test_prepared),
     )?;
     let truth = test.iter().map(|&i| labels[i]).collect::<Vec<_>>();
     let validation_truth = validation.iter().map(|&i| labels[i]).collect::<Vec<_>>();
@@ -358,6 +378,7 @@ fn evaluate(
             "validation_batches": validation_batches.iter().map(|(context, query)| json!({"context": context, "query": query})).collect::<Vec<_>>(),
             "test_batches": test_batches.iter().map(|(context, query)| json!({"context": context, "query": query})).collect::<Vec<_>>(),
             "validation_scores": validation_scores, "test_scores": predictions,
+            "validation_prepared": validation_prepared, "test_prepared": test_prepared,
         });
         fs::write(
             &trace_path,

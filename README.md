@@ -198,12 +198,25 @@ rows:
 | Regression MAE | 2.9421 | 2.9675 | +0.0254 |
 | Regression RMSE | 3.9460 | 4.0062 | +0.0602 |
 
-The test predictions have Pearson correlation 0.902 (classification log-odds)
-and 0.986 (regression medians); mean absolute prediction differences are 0.323
-and 0.643 respectively. The reports are in
-`output/medium-{classification,regression}-context-32-official-python.json`.
-The initial comparison used faulty ONNX exports and overstated the regression
-error; do not use those old metrics. To reproduce after installing the official
+The high-level predictions are not expected to match row by row: the Rust and
+Python recipes independently draw random feature permutations and sign flips,
+so the models receive different tensors even though context/query row indices
+match. Those metrics measure two randomized end-to-end pipelines, not model
+numerical parity. To isolate inference, Rust `--trace` now records the exact
+prepared `x`, `y`, categorical mask, raw ONNX outputs, and target/class inverse
+transform metadata for every batch. `scripts/check_prepared_core_parity.py`
+feeds those same tensors to the official FP32 `_KumoTabular` core. On the 344
+classification test rows, Rust and PyTorch log-odds have mean absolute
+prediction difference `0.00092`, maximum `0.0122`, and correlation `0.9999989`.
+On 301 regression rows, median predictions differ by `0.00356` on average
+(maximum `0.0346`) with correlation `0.9999996`. The raw core-output mean
+absolute errors are also available in
+`output/medium-{classification,regression}-context-32-prepared-core-parity.json`.
+These small residuals are consistent with FP16 ONNX weights; the prior `0.902`
+and `0.986` correlations came from comparing different randomized recipe
+inputs. The earlier faulty-export metrics are obsolete.
+
+To reproduce the high-level official API comparison after installing the
 package and dependencies into the isolated `.venv-official` Python environment:
 
 ```sh
@@ -214,6 +227,10 @@ OMP_NUM_THREADS=4 .venv-official/bin/python scripts/compare_official_medium.py \
   --task classification --seed 42 --context-rows 32
 OMP_NUM_THREADS=4 .venv-official/bin/python scripts/compare_official_medium.py \
   --task regression --seed 42 --context-rows 32
+OMP_NUM_THREADS=4 .venv-official/bin/python scripts/check_prepared_core_parity.py \
+  --task classification --split test --seed 42 --context-rows 32
+OMP_NUM_THREADS=4 .venv-official/bin/python scripts/check_prepared_core_parity.py \
+  --task regression --split test --seed 42 --context-rows 32
 ```
 
 This controls rows, labels, model size, and estimator count, **not** recipe
