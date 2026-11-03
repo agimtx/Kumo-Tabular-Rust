@@ -267,27 +267,63 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                     raise ValueError(f"non-finite weight values in {name}")
                 scale = max_abs / 7.0 if max_abs > 0 else 1.0
                 encoded = encode_int4(values.astype(np.float64) / scale)
-                compressed = onnx.helper.make_tensor(
-                    name=name + "_int4", data_type=TensorProto.INT4,
-                    dims=values.shape, vals=encoded.tobytes(), raw=True,
+                compressed = numpy_helper.from_array(
+                    encoded, name=name + "_int4_packed_uint8"
                 )
             weight.CopyFrom(compressed)
             if quantization == "fp8":
-                casts.append(onnx.helper.make_node(
-                    "Gather", [fp8_lookup_name, compressed.name], [name],
-                    name=name + "_fp8_decode", axis=0,
+                indices_name = name + "_fp8_indices"
+                casts.extend((
+                    onnx.helper.make_node(
+                        "Cast", [compressed.name], [indices_name],
+                        name=name + "_fp8_indices_cast", to=TensorProto.INT64,
+                    ),
+                    onnx.helper.make_node(
+                        "Gather", [fp8_lookup_name, indices_name], [name],
+                        name=name + "_fp8_decode", axis=0,
+                    ),
                 ))
             elif quantization == "int4":
-                graph.graph.initializer.append(
-                    numpy_helper.from_array(np.asarray(scale, dtype=np.float32), name=name + "_scale")
-                )
-                graph.graph.initializer.append(
-                    numpy_helper.from_array(np.asarray(0, dtype=np.int8), name=name + "_zero_point")
-                )
-                casts.append(onnx.helper.make_node(
-                    "DequantizeLinear",
-                    [compressed.name, name + "_scale", name + "_zero_point"],
-                    [name], name=name + "_dequantize", axis=0,
+                shape = np.asarray(values.shape, dtype=np.int64)
+                flat_name = name + "_int4_flat"
+                sliced_name = name + "_int4_unpadded"
+                gathered_name = name + "_int4_pairs"
+                indices_name = name + "_int4_indices"
+                graph.graph.initializer.extend((
+                    numpy_helper.from_array(np.asarray(scale, dtype=np.float32), name=name + "_scale"),
+                    numpy_helper.from_array(np.asarray([-1], dtype=np.int64), name=name + "_flat_shape"),
+                    numpy_helper.from_array(np.asarray([0], dtype=np.int64), name=name + "_slice_start"),
+                    numpy_helper.from_array(np.asarray([values.size], dtype=np.int64), name=name + "_slice_end"),
+                    numpy_helper.from_array(np.asarray([0], dtype=np.int64), name=name + "_slice_axis"),
+                    numpy_helper.from_array(np.asarray([1], dtype=np.int64), name=name + "_slice_step"),
+                    numpy_helper.from_array(shape, name=name + "_shape"),
+                ))
+                casts.extend((
+                    onnx.helper.make_node(
+                        "Cast", [compressed.name], [indices_name],
+                        name=name + "_int4_indices_cast", to=TensorProto.INT64,
+                    ),
+                    onnx.helper.make_node(
+                        "Gather", ["__int4_byte_to_pair", indices_name], [gathered_name],
+                        name=name + "_int4_unpack", axis=0,
+                    ),
+                    onnx.helper.make_node(
+                        "Reshape", [gathered_name, name + "_flat_shape"], [flat_name],
+                        name=name + "_int4_flatten",
+                    ),
+                    onnx.helper.make_node(
+                        "Slice", [flat_name, name + "_slice_start", name + "_slice_end",
+                                  name + "_slice_axis", name + "_slice_step"], [sliced_name],
+                        name=name + "_int4_remove_padding",
+                    ),
+                    onnx.helper.make_node(
+                        "Reshape", [sliced_name, name + "_shape"], [name + "_int4_values"],
+                        name=name + "_int4_restore_shape",
+                    ),
+                    onnx.helper.make_node(
+                        "Mul", [name + "_int4_values", name + "_scale"], [name],
+                        name=name + "_int4_dequantize",
+                    ),
                 ))
             else:
                 casts.append(onnx.helper.make_node(
@@ -300,6 +336,16 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
             ).astype(np.float32)
             graph.graph.initializer.append(
                 numpy_helper.from_array(fp8_values, name=fp8_lookup_name)
+            )
+        elif quantization == "int4":
+            byte_values = np.arange(256, dtype=np.uint8)
+            low = (byte_values & 0x0F).astype(np.int8)
+            high = (byte_values >> 4).astype(np.int8)
+            low[low >= 8] -= 16
+            high[high >= 8] -= 16
+            int4_lookup = np.stack((low, high), axis=1).astype(np.float32)
+            graph.graph.initializer.append(
+                numpy_helper.from_array(int4_lookup, name="__int4_byte_to_pair")
             )
         for cast in reversed(casts):
             graph.graph.node.insert(0, cast)
