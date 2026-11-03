@@ -92,6 +92,25 @@ pub struct Prepared {
     pub class_permutation: Vec<f64>,
 }
 
+fn ordered_feature_sources(
+    keep: &[usize],
+    kinds: &[FeatureType],
+    count_count: usize,
+) -> Vec<usize> {
+    let mut sources = keep
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &column)| {
+            (kinds[column] == FeatureType::Numerical).then_some(position)
+        })
+        .collect::<Vec<_>>();
+    sources.extend(keep.len()..keep.len() + count_count);
+    sources.extend(keep.iter().enumerate().filter_map(|(position, &column)| {
+        (kinds[column] == FeatureType::Categorical).then_some(position)
+    }));
+    sources
+}
+
 /// Fit context statistics and transform context + query rows in that order.
 pub fn prepare(
     rows: &[Vec<Value>],
@@ -155,9 +174,12 @@ pub fn prepare(
                     .map(|(i, s)| (s.clone(), i))
                     .collect();
                 let mut counts = BTreeMap::new();
+                let mut negative_count = 0;
                 for &i in context_indices {
                     if let Some(s) = category(&rows[i][c]) {
                         *counts.entry(s).or_insert(0usize) += 1;
+                    } else {
+                        negative_count += 1;
                     }
                 }
                 let codes_seen = context_indices
@@ -172,7 +194,7 @@ pub fn prepare(
                     keep.push(c);
                 }
                 if codes.len() > CARDINALITY_THRESHOLD {
-                    high.push((c, counts));
+                    high.push((c, counts, negative_count));
                 }
                 categories.push(Some(codes));
             }
@@ -247,32 +269,41 @@ pub fn prepare(
             }
         }
     }
-    let count_stats = high
+    let categorical_count_columns = high
         .iter()
-        .map(|(c, counts)| {
+        .map(|(c, counts, negative_count)| {
             let values = context_indices
                 .iter()
                 .map(|&i| {
-                    (category(&rows[i][*c])
+                    let count = category(&rows[i][*c])
                         .and_then(|v| counts.get(&v).copied())
-                        .unwrap_or(0) as f64)
-                        .ln_1p()
+                        .unwrap_or(*negative_count);
+                    (count as f64).ln_1p()
                 })
                 .collect::<Vec<_>>();
+            (c, counts, negative_count, values)
+        })
+        .collect::<Vec<_>>();
+    let count_stats = categorical_count_columns
+        .iter()
+        .map(|(_, _, _, values)| {
             if values.iter().all(|&v| v == values[0]) {
                 None
             } else {
-                Some(numeric_stats(&values, rng, false))
+                Some(numeric_stats(values, rng, false))
             }
         })
         .collect::<Vec<_>>();
-    let count_columns = high
+    let count_columns = categorical_count_columns
         .iter()
         .enumerate()
-        .filter_map(|(index, value)| count_stats[index].map(|stats| (value, stats)))
+        .filter_map(|(index, value)| {
+            count_stats[index].map(|stats| (value.0, value.1, value.2, stats))
+        })
         .collect::<Vec<_>>();
+    let initial_sources = ordered_feature_sources(&keep, &kinds, count_columns.len());
     // First Latin member uses base[(0 - row_rank) mod C], not a plain permutation.
-    let mut permutation: Vec<usize> = (0..keep.len() + count_columns.len()).collect();
+    let mut permutation: Vec<usize> = (0..initial_sources.len()).collect();
     permutation.shuffle(rng);
     let mut rows_order: Vec<usize> = (0..permutation.len()).collect();
     rows_order.shuffle(rng);
@@ -282,12 +313,19 @@ pub fn prepare(
             .map(|&r| permutation[(permutation.len() - r) % permutation.len()])
             .collect();
     }
-    permutation.truncate(500);
     let mut mask: Vec<bool> = keep
         .iter()
         .map(|&c| kinds[c] == FeatureType::Categorical)
         .collect();
     mask.extend(std::iter::repeat(false).take(count_columns.len()));
+    let mask = initial_sources
+        .iter()
+        .map(|&source| mask[source])
+        .collect::<Vec<_>>();
+    let mask = permutation
+        .iter()
+        .map(|&source| mask[source])
+        .collect::<Vec<_>>();
     let row_indices: Vec<usize> = context_indices
         .iter()
         .chain(query_indices)
@@ -295,7 +333,7 @@ pub fn prepare(
         .collect();
     let mut x = Array2::<f32>::zeros((row_indices.len(), permutation.len()));
     for (r, &i) in row_indices.iter().enumerate() {
-        let mut values = vec![0f32; permutation.len()];
+        let mut values = vec![0f32; initial_sources.len()];
         for (j, &c) in keep.iter().enumerate() {
             values[j] = if let Some(stats) = numeric[c] {
                 transform_numeric(number(&rows[i][c]).unwrap_or(f64::NAN), stats)
@@ -310,14 +348,14 @@ pub fn prepare(
                 )
             };
         }
-        for (k, &((c, counts), stats)) in count_columns.iter().enumerate() {
+        for (k, &(c, counts, negative_count, stats)) in count_columns.iter().enumerate() {
             let count = category(&rows[i][*c])
                 .and_then(|v| counts.get(&v).copied())
-                .unwrap_or(0);
+                .unwrap_or(*negative_count);
             values[keep.len() + k] = transform_numeric((count as f64).ln_1p(), stats);
         }
         for (out, &source) in permutation.iter().enumerate() {
-            x[(r, out)] = values[source];
+            x[(r, out)] = values[initial_sources[source]];
         }
     }
     let labels = context_indices
@@ -334,7 +372,7 @@ pub fn prepare(
             }
         })
         .collect();
-    // Mask follows transformed columns, including appended count features and shuffle.
+    // Mask follows numerical, count, categorical and Latin-permuted columns.
     let mask = permutation.iter().map(|&i| mask[i]).collect();
     // Keep named feature order observable through an optional debug invariant.
     debug_assert!(keep.iter().all(|&i| i < feature_names.len()));
@@ -396,6 +434,57 @@ mod tests {
     fn n(x: i64) -> Value {
         Value::Number(x.into())
     }
+
+    #[test]
+    fn official_feature_blocks_order_numeric_then_counts_then_categories() {
+        let keep = [0, 1, 2, 3];
+        let kinds = [
+            FeatureType::Categorical,
+            FeatureType::Numerical,
+            FeatureType::Categorical,
+            FeatureType::Numerical,
+        ];
+        assert_eq!(ordered_feature_sources(&keep, &kinds, 1), [1, 3, 4, 0, 2]);
+    }
+
+    #[test]
+    fn negative_category_codes_share_the_fitted_count() {
+        let rows = (0..55)
+            .map(|i| {
+                if i == 0 || i == 1 {
+                    vec![Value::Null]
+                } else {
+                    vec![s(&format!("c{i}"))]
+                }
+            })
+            .collect::<Vec<_>>();
+        let labels = vec![0.0; rows.len()];
+        let context = (0..53).collect::<Vec<_>>();
+        let mut rng = StdRng::seed_from_u64(11);
+        let prepared = prepare(
+            &rows,
+            &["category"],
+            &context,
+            &[53],
+            &labels,
+            Task::Classification,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(prepared.x.ncols(), 2);
+        let count_column = prepared
+            .categorical_mask
+            .iter()
+            .position(|is_categorical| !is_categorical)
+            .unwrap();
+        let missing_a = prepared.x[(0, count_column)];
+        let missing_b = prepared.x[(1, count_column)];
+        let unseen_query = prepared.x[(53, count_column)];
+        assert_eq!(missing_a, missing_b);
+        assert_eq!(missing_a, unseen_query);
+        assert!(missing_a.is_finite());
+    }
+
     #[test]
     fn includes_context_then_query_and_context_labels() {
         let rows = vec![vec![n(1)], vec![n(3)], vec![n(5)]];

@@ -4,5 +4,6 @@ checkpoints/
 output/
 target/
 .cargo-home/
+.venv-official/
 __pycache__/
 .DS_Store

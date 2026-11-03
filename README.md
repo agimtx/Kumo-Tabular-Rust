@@ -46,7 +46,7 @@ The export script and workflow are described below. For external-data ONNX model
 
 ## Export ONNX
 
-In GitHub Actions, run **Export Kumo Tabular ONNX** manually and choose `small`, `medium`, or `large` and either `classification` or `regression`. The workflow downloads the matching checkpoint from NVIDIA Kumo-Tabular, converts it with Python, stores model weights as FP16, and provides the `.onnx` file as a run artifact. The graph casts weights back to FP32 for computation. FP16 quantization is lossy.
+In GitHub Actions, run **Export Kumo Tabular ONNX** manually and choose `small`, `medium`, or `large` and either `classification` or `regression`. The workflow downloads the matching checkpoint from NVIDIA Kumo-Tabular, converts it with Python, stores model weights as FP16, and provides the `.onnx` file as a run artifact. The graph casts weights back to FP32 for computation. FP16 quantization is lossy. The exporter also repairs a legacy tracing bug in ICL attention key-length selection (`key.size(-3)`), validates all expected query-scaling paths, then stores the graph. This correction is required for correct context-dependent logits.
 
 Local export with an existing small classifier checkpoint:
 
@@ -114,15 +114,15 @@ weak. Fixed three-feature, four-context-row core exports cannot recover the
 omitted features or emulate the public KumoTabular pipeline's larger context
 and preprocessing; the remaining gap is not evidence of a quantization bug.
 
-## Full-feature Rust evaluation (new dynamic exports required)
+## Full-feature Rust evaluation (dynamic FP16 exports)
 
-The separate `evaluate_full` binary consumes **new** `*-dynamic-fp16.onnx`
-models and never reuses the old fixed-shape reports. Run the updated
-**Export Kumo Tabular ONNX** GitHub Action four times: `small`/`medium` times
-`classification`/`regression`. Each run downloads NVIDIA's `v1.0.1`
-checkpoint, exports variable-length context/query rows and feature columns,
-and validates two distinct shapes through ONNX Runtime before uploading the
-artifact. Put each artifact's ONNX file at its corresponding path:
+The separate `evaluate_full` binary consumes `*-dynamic-fp16.onnx` models
+and never reuses the old fixed-shape reports. The updated **Export Kumo Tabular
+ONNX** GitHub Action takes `small`/`medium` and `classification`/`regression`
+as inputs; each run downloads NVIDIA's `v1.0.1` checkpoint and checks two
+input shapes through ONNX Runtime. All four resulting models have been
+validated locally with 32 context/2 query rows and 16 context/1 query row,
+different feature counts, and changed query inputs. Place them at:
 
 ```text
 small/kumo-tabular-small-classification-dynamic-fp16.onnx
@@ -142,7 +142,9 @@ cargo run --locked --offline --release --bin evaluate_full -- --seed 42 --size b
 This reads every non-target column: 13 features (including categorical
 columns) in customer classification and 5 numerical features in airfoil
 regression. Each inference uses 32 fitted context examples and up to 2 query
-rows. The Rust recipe fits numeric statistics and category vocabularies on
+rows by default; `--context-rows 16` or `--context-rows 64` changes the
+context size and writes a separate report. The Rust recipe fits numeric
+statistics and category vocabularies on
 context rows, drops constants, standardizes/clips, handles high-cardinality
 counts, applies the default one-estimator identity option and fitted sigma
 clipping, sign/category shifts, column permutation, and inverse target
@@ -153,8 +155,72 @@ inputs; multi-estimator output aggregation and the remaining nonlinear recipe
 options are **not implemented** here. Rust and PyTorch random generators also
 do not produce identical permutations from the same seed. This is an
 all-feature Rust implementation of the default single-estimator route, **not
-bit-for-bit Python predictor parity**. Its new results will be written to
-`output/small-full-evaluation-rust.json` and
-`output/medium-full-evaluation-rust.json` only after the new models arrive.
-Until then, the existing JSON reports above refer exclusively to the old
-fixed `[6,3]` graphs; no new full-feature accuracy has been measured.
+bit-for-bit Python predictor parity**. The full-feature reports for seed 42
+are in `output/{small,medium}-full-evaluation-rust.json` (32 context rows)
+and `output/{small,medium}-full-context-{16,64}-evaluation-rust.json`.
+The earlier `*-evaluation-rust.json` reports still describe the old `[6,3]`
+graphs, not these dynamic models.
+
+| Context rows | Model | Classification AUC | Balanced accuracy | Accuracy | Regression MAE | RMSE |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 16 | small | 0.596 | 0.514 | 0.177 | 4.618 | 6.045 |
+| 32 | small | 0.621 | 0.569 | 0.770 | 3.270 | 4.444 |
+| 64 | small | 0.664 | 0.639 | 0.698 | 2.330 | 3.084 |
+| 16 | medium | 0.634 | 0.605 | 0.497 | 4.855 | 6.056 |
+| 32 | medium | 0.675 | 0.606 | 0.677 | 4.527 | 5.646 |
+| 64 | medium | 0.659 | 0.632 | 0.744 | 4.221 | 5.279 |
+
+All runs use the same held-out rows (344 classification, 301 regression),
+with thresholds fitted only on validation rows. The classification all-No
+accuracy baseline is 0.887; regression fit-mean MAE is 5.657. More context
+improves regression MAE in these runs, especially for small, but classification
+remains below the majority-class accuracy baseline and threshold selection is
+unstable at 16 rows. The 16/32/64 comparison reuses the same test split: it is
+an exploratory granularity study, **not** independent validation of a
+context-size choice. For a final selected setting, evaluate on a fresh holdout.
+
+## Official medium Python comparison
+
+The local original medium checkpoints `pt/classifier.pt` and `pt/regressor.pt`
+were loaded into the official `structured-data-models==0.2.1` API (PyTorch
+2.7.1, CPU, FP32). The Rust medium evaluator uses the corrected FP16 exports,
+with `--seed 42 --context-rows 32 --trace`; the official API received **the same
+context and query row indices in every batch**, with `num_estimators=1` and its
+own default recipe. Each pipeline fitted its classification threshold using
+its own validation predictions and balanced accuracy. On the identical held-out
+rows:
+
+| Metric | Rust FP16 | Official Python FP32 | Difference (Python - Rust) |
+| --- | ---: | ---: | ---: |
+| Classification ROC AUC | 0.6740 | 0.6557 | -0.0183 |
+| Classification balanced accuracy | 0.6227 | 0.6175 | -0.0052 |
+| Classification accuracy | 0.6483 | 0.6192 | -0.0291 |
+| Regression MAE | 2.9421 | 2.9675 | +0.0254 |
+| Regression RMSE | 3.9460 | 4.0062 | +0.0602 |
+
+The test predictions have Pearson correlation 0.902 (classification log-odds)
+and 0.986 (regression medians); mean absolute prediction differences are 0.323
+and 0.643 respectively. The reports are in
+`output/medium-{classification,regression}-context-32-official-python.json`.
+The initial comparison used faulty ONNX exports and overstated the regression
+error; do not use those old metrics. To reproduce after installing the official
+package and dependencies into the isolated `.venv-official` Python environment:
+
+```sh
+CARGO_HOME="$PWD/.cargo-home" ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
+  cargo run --locked --offline --release --bin evaluate_full -- \
+  --seed 42 --size medium --context-rows 32 --trace
+OMP_NUM_THREADS=4 .venv-official/bin/python scripts/compare_official_medium.py \
+  --task classification --seed 42 --context-rows 32
+OMP_NUM_THREADS=4 .venv-official/bin/python scripts/compare_official_medium.py \
+  --task regression --seed 42 --context-rows 32
+```
+
+This controls rows, labels, model size, and estimator count, **not** recipe
+randomness or arithmetic precision: Rust uses its own RNG and FP16 ONNX
+weights, while the official Python code uses PyTorch RNG, its exact recipe,
+and FP32 checkpoints. The exported core network was separately checked on
+identical tensors against PyTorch; at 32 contexts, mean absolute output error is
+0.00165 for classification logits and 0.00020 for regression quantiles, with
+correlations above 0.999999. This isolates the former large gap to a legacy
+ONNX tracing bug, now repaired, rather than the FP16 conversion.

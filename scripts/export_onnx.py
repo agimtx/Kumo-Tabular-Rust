@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import onnx
+import numpy as np
 import torch
 import torch.nn.functional as functional
 
@@ -106,6 +107,74 @@ def export_rms_norm(g, values, normalized_shape, weight, eps):
     return g.op("Mul", normalized, weight)
 
 
+def fix_sdpa_key_length_gathers(graph: onnx.ModelProto, size: str) -> None:
+    """Repair legacy-exporter key-length gathers in ICL attention scaling."""
+    expected_casts = {"small": 12, "medium": 47, "large": 47}[size]
+    expected_gathers = {"small": 0, "medium": 45, "large": 45}[size]
+    producers = {
+        output: node
+        for node in graph.graph.node
+        for output in node.output
+    }
+    casts = [
+        node for node in graph.graph.node
+        if node.name.startswith("/model/icl_block/layers.")
+        and node.name.endswith(("/query_scaling/Cast", "/query_scaling_1/Cast"))
+    ]
+    if len(casts) != expected_casts:
+        raise RuntimeError(
+            f"expected {expected_casts} ICL query-scaling casts for {size}, found {len(casts)}"
+        )
+
+    gathers = 0
+    for cast in casts:
+        source = producers.get(cast.input[0])
+        if source is None:
+            raise RuntimeError(f"missing query-scaling input producer: {cast.name}")
+        if source.op_type == "Squeeze":
+            slice_node = producers.get(source.input[0])
+            if slice_node is None or slice_node.op_type != "Slice":
+                raise RuntimeError(f"unexpected query-scaling squeeze path: {cast.name}")
+            constants = [producers.get(name) for name in slice_node.input[1:]]
+            if any(item is None or item.op_type != "Constant" for item in constants):
+                raise RuntimeError(f"unexpected key-length slice constants: {slice_node.name}")
+            values = [int(numpy_helper.to_array(
+                next(attribute.t for attribute in item.attribute if attribute.name == "value")
+            ).reshape(-1)[0]) for item in constants]
+            if values[:3] != [-3, -2, 0]:
+                raise RuntimeError(f"unexpected key-length slice axes: {slice_node.name}: {values}")
+            continue
+        if source.op_type != "Gather" or len(source.input) != 2:
+            raise RuntimeError(f"unexpected query-scaling path: {cast.name} -> {source.op_type}")
+        shape = producers.get(source.input[0])
+        key = producers.get(shape.input[0]) if shape is not None and shape.op_type == "Shape" else None
+        if key is None or "/attn/key_transform/" not in key.name and "/model/icl_block/Slice_" not in key.name:
+            raise RuntimeError(f"Gather is not reading the ICL attention key length: {source.name}")
+        axis = next((attribute.i for attribute in source.attribute if attribute.name == "axis"), 0)
+        if axis != 0:
+            raise RuntimeError(f"unexpected Gather axis {axis}: {source.name}")
+        index_node = producers.get(source.input[1])
+        if index_node is None or index_node.op_type != "Constant":
+            raise RuntimeError(f"key-length Gather index is not a Constant: {source.name}")
+        index = next(
+            (attribute.t for attribute in index_node.attribute if attribute.name == "value"),
+            None,
+        )
+        if index is None or np.asarray(numpy_helper.to_array(index)).shape != ():
+            raise RuntimeError(f"key-length Gather index is not scalar: {source.name}")
+        value = int(numpy_helper.to_array(index).item())
+        if value == 1:
+            index.CopyFrom(numpy_helper.from_array(np.asarray(-3, dtype=np.int64)))
+        elif value not in (0, -3):
+            raise RuntimeError(f"unexpected key-length index {value}: {source.name}")
+        gathers += 1
+
+    if gathers != expected_gathers:
+        raise RuntimeError(
+            f"expected {expected_gathers} ICL key-length gathers for {size}, found {gathers}"
+        )
+
+
 def export(checkpoint: Path, output: Path, size: str, task: str) -> None:
     classifier = task == "classification"
     model = _KumoTabular(
@@ -164,6 +233,7 @@ def export(checkpoint: Path, output: Path, size: str, task: str) -> None:
             )
         del model
         graph = onnx.load(str(fp32_path))
+        fix_sdpa_key_length_gathers(graph, size)
         casts = []
         for weight in graph.graph.initializer:
             if weight.data_type != TensorProto.FLOAT:

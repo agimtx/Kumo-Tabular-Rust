@@ -11,7 +11,8 @@ use tabular_onnx::{
 
 type EvalResult<T> = Result<T, Box<dyn Error>>;
 type Dataset = (Vec<String>, Vec<Vec<Value>>, Vec<f64>);
-const CONTEXT: usize = 32;
+type BatchIndices = (Vec<usize>, Vec<usize>);
+const DEFAULT_CONTEXT: usize = 32;
 const QUERIES: usize = 2;
 
 fn load_dataset(path: &str, target: &str) -> EvalResult<Dataset> {
@@ -43,7 +44,7 @@ fn load_dataset(path: &str, target: &str) -> EvalResult<Dataset> {
         .filter(|name| *name != target)
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    if names.is_empty() || rows.len() < CONTEXT + QUERIES {
+    if names.is_empty() || rows.len() < DEFAULT_CONTEXT + QUERIES {
         return Err("not enough features or dataset rows".into());
     }
     let mut features = Vec::with_capacity(rows.len());
@@ -126,10 +127,12 @@ fn infer(
     queries: &[usize],
     task: Task,
     seed: u64,
-) -> EvalResult<(Vec<f64>, f64)> {
+    context_rows: usize,
+) -> EvalResult<(Vec<f64>, f64, Vec<BatchIndices>)> {
     let mut rng = StdRng::seed_from_u64(seed);
     let start = Instant::now();
     let mut predictions = Vec::with_capacity(queries.len());
+    let mut batches = Vec::new();
     for query in queries.chunks(QUERIES) {
         let mut context = if task == Task::Classification {
             [0.0, 1.0]
@@ -139,20 +142,21 @@ fn infer(
                         .copied()
                         .filter(|&i| labels[i] == target)
                         .collect::<Vec<_>>()
-                        .choose_multiple(&mut rng, CONTEXT / 2)
+                        .choose_multiple(&mut rng, context_rows / 2)
                         .copied()
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
         } else {
-            pool.choose_multiple(&mut rng, CONTEXT)
+            pool.choose_multiple(&mut rng, context_rows)
                 .copied()
                 .collect::<Vec<_>>()
         };
-        if context.len() != CONTEXT {
+        if context.len() != context_rows {
             return Err("insufficient context rows".into());
         }
         context.shuffle(&mut rng);
+        batches.push((context.clone(), query.to_vec()));
         let recipe_task = if task == Task::Classification {
             RecipeTask::Classification
         } else {
@@ -211,7 +215,7 @@ fn infer(
             }
         }
     }
-    Ok((predictions, start.elapsed().as_secs_f64()))
+    Ok((predictions, start.elapsed().as_secs_f64(), batches))
 }
 
 fn counts(truth: &[f64], scores: &[f64], threshold: f64) -> [usize; 4] {
@@ -264,7 +268,13 @@ fn auc(truth: &[f64], scores: &[f64]) -> f64 {
     (rank_sum - positive * (positive + 1.0) / 2.0) / (positive * negative)
 }
 
-fn evaluate(size: &str, task: Task, seed: u64) -> EvalResult<Value> {
+fn evaluate(
+    size: &str,
+    task: Task,
+    seed: u64,
+    context_rows: usize,
+    trace: bool,
+) -> EvalResult<Value> {
     let classification = task == Task::Classification;
     let (path, target) = if classification {
         (
@@ -294,13 +304,21 @@ fn evaluate(size: &str, task: Task, seed: u64) -> EvalResult<Value> {
     let (names, features, labels) = load_dataset(path, target)?;
     let names_ref = names.iter().map(String::as_str).collect::<Vec<_>>();
     let (fit, validation, test) = split(&labels, classification, seed);
+    if fit.len() < context_rows
+        || (classification
+            && [0.0, 1.0].iter().any(|&label| {
+                fit.iter().filter(|&&index| labels[index] == label).count() < context_rows / 2
+            }))
+    {
+        return Err("insufficient fit rows for requested context size".into());
+    }
     let mut session = OnnxSession::load(&model)?;
     if session.input_names() != ["x", "y", "categorical_mask"]
         || session.output_names() != ["predictions"]
     {
         return Err("unexpected ONNX tensor contract".into());
     }
-    let (validation_scores, _) = infer(
+    let (validation_scores, _, validation_batches) = infer(
         &mut session,
         &features,
         &names_ref,
@@ -309,8 +327,9 @@ fn evaluate(size: &str, task: Task, seed: u64) -> EvalResult<Value> {
         &validation,
         task,
         seed,
+        context_rows,
     )?;
-    let (predictions, elapsed) = infer(
+    let (predictions, elapsed, test_batches) = infer(
         &mut session,
         &features,
         &names_ref,
@@ -319,9 +338,32 @@ fn evaluate(size: &str, task: Task, seed: u64) -> EvalResult<Value> {
         &test,
         task,
         seed,
+        context_rows,
     )?;
     let truth = test.iter().map(|&i| labels[i]).collect::<Vec<_>>();
     let validation_truth = validation.iter().map(|&i| labels[i]).collect::<Vec<_>>();
+    if trace {
+        fs::create_dir_all("output")?;
+        let trace_path = format!(
+            "output/{size}-{}-context-{context_rows}-seed-{seed}-trace.json",
+            if classification {
+                "classification"
+            } else {
+                "regression"
+            }
+        );
+        let trace_json = json!({
+            "dataset": path, "target": target, "seed": seed, "context_rows": context_rows,
+            "features": names, "fit": fit, "validation": validation, "test": test,
+            "validation_batches": validation_batches.iter().map(|(context, query)| json!({"context": context, "query": query})).collect::<Vec<_>>(),
+            "test_batches": test_batches.iter().map(|(context, query)| json!({"context": context, "query": query})).collect::<Vec<_>>(),
+            "validation_scores": validation_scores, "test_scores": predictions,
+        });
+        fs::write(
+            &trace_path,
+            format!("{}\n", serde_json::to_string_pretty(&trace_json)?),
+        )?;
+    }
     let metrics;
     let cut = if classification {
         Some(threshold(&validation_truth, &validation_scores))
@@ -355,7 +397,7 @@ fn evaluate(size: &str, task: Task, seed: u64) -> EvalResult<Value> {
         json!({"task": if classification { "classification" } else { "regression" },
         "engine": "rust-ort", "pipeline": "kumo-default-single-estimator", "precision": "fp16",
         "model": model, "size": size, "dataset": path, "features": names, "target": target,
-        "context_rows_per_batch": CONTEXT, "queries_per_batch": QUERIES,
+        "context_rows_per_batch": context_rows, "queries_per_batch": QUERIES,
         "context_strategy": "class-balanced-random" , "seed": seed, "fit_rows": fit.len(),
         "validation_rows": validation.len(), "test_rows": test.len(),
         "classification_threshold": cut, "prediction_seconds": elapsed, "metrics": metrics}),
@@ -366,12 +408,21 @@ fn main() -> EvalResult<()> {
     let mut args = std::env::args().skip(1);
     let mut seed = 42;
     let mut size = "both".to_owned();
+    let mut context_rows = DEFAULT_CONTEXT;
+    let mut trace = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().ok_or("missing --seed value")?.parse()?,
             "--size" => size = args.next().ok_or("missing --size value")?,
+            "--context-rows" => {
+                context_rows = args.next().ok_or("missing --context-rows value")?.parse()?
+            }
+            "--trace" => trace = true,
             _ => return Err(format!("unknown argument: {arg}").into()),
         }
+    }
+    if context_rows < 2 || context_rows % 2 != 0 {
+        return Err("--context-rows must be an even integer of at least 2".into());
     }
     let sizes = match size.as_str() {
         "both" => vec!["small", "medium"],
@@ -381,10 +432,14 @@ fn main() -> EvalResult<()> {
     };
     for size in sizes {
         let report = vec![
-            evaluate(size, Task::Classification, seed)?,
-            evaluate(size, Task::Regression, seed)?,
+            evaluate(size, Task::Classification, seed, context_rows, trace)?,
+            evaluate(size, Task::Regression, seed, context_rows, trace)?,
         ];
-        let path = format!("output/{size}-full-evaluation-rust.json");
+        let path = if context_rows == DEFAULT_CONTEXT {
+            format!("output/{size}-full-evaluation-rust.json")
+        } else {
+            format!("output/{size}-full-context-{context_rows}-evaluation-rust.json")
+        };
         fs::create_dir_all("output")?;
         fs::write(
             &path,
