@@ -3,9 +3,13 @@
 import argparse
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import onnx
 import torch
+import torch.nn.functional as functional
+
+original_scaled_dot_product_attention = functional.scaled_dot_product_attention
 from onnx import TensorProto, numpy_helper
 from torch.onnx import symbolic_helper
 from sdm.models.kumo.tabular.model import MODEL_KWARGS, _KumoTabular
@@ -41,6 +45,42 @@ def export_matrix_transpose(g, values):
     permutation = list(range(rank))
     permutation[-2:] = permutation[-2:][::-1]
     return g.op("Transpose", values, perm_i=permutation)
+
+
+def export_scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> torch.Tensor:
+    if not enable_gqa:
+        return original_scaled_dot_product_attention(
+            query, key, value, attn_mask, dropout_p, is_causal, scale
+        )
+
+    repeats = query.size(-3) // key.size(-3)
+    key = key.repeat_interleave(repeats, dim=-3)
+    value = value.repeat_interleave(repeats, dim=-3)
+    factor = scale if scale is not None else query.size(-1) ** -0.5
+    scores = torch.matmul(query, key.transpose(-2, -1)) * factor
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            scores = scores.masked_fill(~attn_mask, float("-inf"))
+        else:
+            scores = scores + attn_mask
+    if is_causal:
+        causal = torch.ones(
+            query.size(-2), key.size(-2), dtype=torch.bool, device=query.device
+        ).tril()
+        scores = scores.masked_fill(~causal, float("-inf"))
+    probabilities = torch.softmax(scores, dim=-1)
+    if dropout_p:
+        probabilities = functional.dropout(probabilities, dropout_p)
+    return torch.matmul(probabilities, value)
 
 
 @symbolic_helper.parse_args("v", "is", "v", "f")
@@ -86,7 +126,11 @@ def export(checkpoint: Path, output: Path, size: str, task: str) -> None:
         fp32_path = Path(temporary_dir) / "model-fp32.onnx"
         # The gradient-enabled branch avoids inference-only output buffers and
         # chunking, which are not part of the mathematical forward pass.
-        with torch.enable_grad():
+        with torch.enable_grad(), patch.object(
+            functional,
+            "scaled_dot_product_attention",
+            export_scaled_dot_product_attention,
+        ):
             torch.onnx.register_custom_op_symbolic(
                 "aten::nanmean", export_nanmean, 17
             )
