@@ -1,4 +1,4 @@
-"""Compare official FP32 KumoTabular with traced Rust medium FP16 batches.
+"""Compare official FP32 KumoTabular with traced Rust medium ONNX batches.
 
 Run with the isolated Python environment described in README. Each context and
 query row index is read from Rust's --trace output; no Python split is drawn.
@@ -63,9 +63,14 @@ def main() -> None:
     parser.add_argument("--context-rows", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("cpu", "mps"), default="cpu")
+    parser.add_argument("--precision", choices=("fp16", "fp8", "int4"), default="fp16")
     args = parser.parse_args()
     trace_path = Path(f"output/medium-{args.task}-context-{args.context_rows}-seed-{args.seed}-trace.json")
+    report_path = Path(f"output/medium-{args.task}-{args.precision}-full-evaluation-rust.json")
     trace = json.loads(trace_path.read_text())
+    rust_report = json.loads(report_path.read_text())[0]
+    if rust_report["task"] != args.task or rust_report["precision"] != args.precision:
+        raise ValueError(f"{report_path} does not match requested task and precision")
     dataframe = pd.read_parquet(trace["dataset"])
     assert len(dataframe) > max(trace["fit"] + trace["validation"] + trace["test"])
     assert list(dataframe.drop(columns=trace["target"]).columns) == trace["features"]
@@ -128,16 +133,29 @@ def main() -> None:
                    "r2": float(1 - np.square(error).sum() / np.square(test_truth - test_truth.mean()).sum())}
     if not all(math.isfinite(value) for value in (validation_predictions.tolist() + test_predictions.tolist())):
         raise ValueError("official predictions contain nonfinite values")
-    rust = np.asarray(trace["test_scores"], dtype=float)
-    comparison = {"pearson": float(np.corrcoef(rust, test_predictions)[0, 1]),
-                  "mean_absolute_prediction_difference": float(np.abs(rust - test_predictions).mean())}
+    rust = np.asarray(rust_report["test_predictions"], dtype=float)
+    if len(rust) != len(test_predictions):
+        raise ValueError("Rust and PyTorch held-out predictions have different lengths")
+    difference = test_predictions - rust
+    compared_metrics = ("roc_auc_yes", "balanced_accuracy", "accuracy", "f1_yes") if args.task == "classification" else ("mae", "rmse", "r2")
+    comparison = {
+        "rust_precision": args.precision,
+        "rust_metrics": rust_report["metrics"],
+        "official_minus_rust_metrics": {key: metrics[key] - rust_report["metrics"][key]
+                                         for key in compared_metrics},
+        "prediction_pearson": float(np.corrcoef(rust, test_predictions)[0, 1]),
+        "prediction_mae_difference": float(np.abs(difference).mean()),
+        "prediction_rmse_difference": float(np.sqrt(np.square(difference).mean())),
+        "prediction_bias_official_minus_rust": float(difference.mean()),
+    }
     output = {"engine": "official-python-torch", "precision": "fp32", "size": "medium", "task": args.task,
               "model": str(Path("pt") / ("classifier.pt" if args.task == "classification" else "regressor.pt")),
-              "trace": str(trace_path), "context_rows": args.context_rows, "seed": args.seed,
+              "trace": str(trace_path), "rust_report": str(report_path),
+              "context_rows": args.context_rows, "seed": args.seed,
               "num_estimators": 1, "device": args.device, "evaluation_seconds": elapsed,
               "classification_threshold": cut, "metrics": metrics, "comparison_to_rust": comparison,
               "test_predictions": test_predictions.tolist(), "validation_predictions": validation_predictions.tolist()}
-    output_path = Path(f"output/medium-{args.task}-context-{args.context_rows}-official-python.json")
+    output_path = Path(f"output/medium-{args.task}-{args.precision}-official-comparison.json")
     output_path.write_text(json.dumps(output, indent=2) + "\n")
     print(json.dumps({key: output[key] for key in ("task", "metrics", "comparison_to_rust", "evaluation_seconds")}, indent=2), flush=True)
     print(f"Report: {output_path}", flush=True)

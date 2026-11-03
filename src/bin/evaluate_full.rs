@@ -290,6 +290,7 @@ fn evaluate(
     seed: u64,
     context_rows: usize,
     trace: bool,
+    precision: &str,
 ) -> EvalResult<Value> {
     let classification = task == Task::Classification;
     let (path, target) = if classification {
@@ -304,7 +305,7 @@ fn evaluate(
         )
     };
     let model = format!(
-        "{size}/kumo-tabular-{size}-{}-dynamic-fp16.onnx",
+        "models/kumo-tabular-{size}-{}-dynamic-{precision}.onnx",
         if classification {
             "classification"
         } else {
@@ -416,21 +417,23 @@ fn evaluate(
     }
     Ok(
         json!({"task": if classification { "classification" } else { "regression" },
-        "engine": "rust-ort", "pipeline": "kumo-default-single-estimator", "precision": "fp16",
+        "engine": "rust-ort", "pipeline": "kumo-default-single-estimator", "precision": precision,
         "model": model, "size": size, "dataset": path, "features": names, "target": target,
         "context_rows_per_batch": context_rows, "queries_per_batch": QUERIES,
         "context_strategy": "class-balanced-random" , "seed": seed, "fit_rows": fit.len(),
         "validation_rows": validation.len(), "test_rows": test.len(),
-        "classification_threshold": cut, "prediction_seconds": elapsed, "metrics": metrics}),
+        "classification_threshold": cut, "prediction_seconds": elapsed, "test_predictions": predictions,
+        "metrics": metrics}),
     )
 }
 
 fn main() -> EvalResult<()> {
     let mut args = std::env::args().skip(1);
     let mut seed = 42;
-    let mut size = "both".to_owned();
+    let mut size = "medium".to_owned();
     let mut context_rows = DEFAULT_CONTEXT;
     let mut trace = false;
+    let mut task_filter = "both".to_owned();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().ok_or("missing --seed value")?.parse()?,
@@ -439,6 +442,7 @@ fn main() -> EvalResult<()> {
                 context_rows = args.next().ok_or("missing --context-rows value")?.parse()?
             }
             "--trace" => trace = true,
+            "--task" => task_filter = args.next().ok_or("missing --task value")?,
             _ => return Err(format!("unknown argument: {arg}").into()),
         }
     }
@@ -451,25 +455,37 @@ fn main() -> EvalResult<()> {
         "medium" => vec!["medium"],
         _ => return Err("size must be small, medium or both".into()),
     };
+    let tasks: Vec<(&str, Task)> = match task_filter.as_str() {
+        "both" => vec![("classification", Task::Classification), ("regression", Task::Regression)],
+        "classification" => vec![("classification", Task::Classification)],
+        "regression" => vec![("regression", Task::Regression)],
+        _ => return Err("task must be classification, regression or both".into()),
+    };
     for size in sizes {
-        let report = vec![
-            evaluate(size, Task::Classification, seed, context_rows, trace)?,
-            evaluate(size, Task::Regression, seed, context_rows, trace)?,
-        ];
-        let path = if context_rows == DEFAULT_CONTEXT {
-            format!("output/{size}-full-evaluation-rust.json")
-        } else {
-            format!("output/{size}-full-context-{context_rows}-evaluation-rust.json")
-        };
-        fs::create_dir_all("output")?;
-        fs::write(
-            &path,
-            format!("{}\n", serde_json::to_string_pretty(&report)?),
-        )?;
-        println!(
-            "{size} report: {path}\n{}",
-            serde_json::to_string_pretty(&report)?
-        );
+        for precision in ["fp16", "fp8", "int4"] {
+            let mut report = Vec::new();
+            for &(name, task) in &tasks {
+                let model = format!("models/kumo-tabular-{size}-{name}-dynamic-{precision}.onnx");
+                if !Path::new(&model).is_file() {
+                    continue;
+                }
+                report.push(evaluate(size, task, seed, context_rows, trace, precision)?);
+            }
+            if report.is_empty() {
+                continue;
+            }
+            for result in &report {
+                let task_name = result["task"].as_str().unwrap_or("unknown");
+                let path = if context_rows == DEFAULT_CONTEXT {
+                    format!("output/{size}-{task_name}-{precision}-full-evaluation-rust.json")
+                } else {
+                    format!("output/{size}-{task_name}-{precision}-full-context-{context_rows}-evaluation-rust.json")
+                };
+                fs::create_dir_all("output")?;
+                fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&vec![result])?))?;
+                println!("{size} {task_name} {precision} report: {path}");
+            }
+        }
     }
     Ok(())
 }

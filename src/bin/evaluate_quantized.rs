@@ -16,6 +16,23 @@ use tabular_onnx::{OnnxSession, Task};
 type EvalResult<T> = Result<T, Box<dyn Error>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Precision {
+    Fp16,
+    Fp8,
+    Int4,
+}
+
+impl Precision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fp16 => "fp16",
+            Self::Fp8 => "fp8",
+            Self::Int4 => "int4",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelSize {
     Small,
     Medium,
@@ -39,17 +56,14 @@ impl ModelSize {
 }
 
 impl ModelSize {
-    fn model_path(self, task: Task) -> &'static str {
-        match (self, task) {
-            (Self::Small, Task::Classification) => {
-                "small/kumo-tabular-small-classification-fp16.onnx"
-            }
-            (Self::Small, Task::Regression) => "small/kumo-tabular-small-regression-fp16.onnx",
-            (Self::Medium, Task::Classification) => {
-                "medium/kumo-tabular-medium-classification-fp16.onnx"
-            }
-            (Self::Medium, Task::Regression) => "medium/kumo-tabular-medium-regression-fp16.onnx",
-        }
+    fn model_path(self, task: Task, precision: Precision) -> String {
+        format!(
+            "{}/kumo-tabular-{}-{}-{}.onnx",
+            self.as_str(),
+            self.as_str(),
+            if task == Task::Classification { "classification" } else { "regression" },
+            precision.as_str(),
+        )
     }
 }
 
@@ -435,7 +449,7 @@ fn validation_split(
     (fit, validation)
 }
 
-fn evaluate(task: Task, size: ModelSize, seed: u64) -> EvalResult<Value> {
+fn evaluate(task: Task, size: ModelSize, precision: Precision, seed: u64) -> EvalResult<Value> {
     let classification = task == Task::Classification;
     let (path, features, target) = if classification {
         (
@@ -454,7 +468,7 @@ fn evaluate(task: Task, size: ModelSize, seed: u64) -> EvalResult<Value> {
             "scaled-sound-pressure",
         )
     };
-    let model = size.model_path(task);
+    let model = size.model_path(task, precision);
     let data = load_data(path, features, target, classification)?;
     let mut rng = StdRng::seed_from_u64(seed);
     let (train, test) = split(&data, classification, &mut rng);
@@ -463,7 +477,7 @@ fn evaluate(task: Task, size: ModelSize, seed: u64) -> EvalResult<Value> {
     }
     let (fit, validation) = validation_split(&train, &data.targets, classification, seed);
     let x = standardize(&data, &fit);
-    let mut session = OnnxSession::load(model)?;
+    let mut session = OnnxSession::load(&model)?;
     if session.input_names() != ["x", "y", "categorical_mask"]
         || session.output_names() != ["predictions"]
     {
@@ -550,7 +564,7 @@ fn evaluate(task: Task, size: ModelSize, seed: u64) -> EvalResult<Value> {
     };
     Ok(json!({
         "task": if classification { "classification" } else { "regression" },
-        "engine": "rust-ort", "size": size.as_str(), "precision": "fp16", "dataset": path, "model": model,
+        "engine": "rust-ort", "size": size.as_str(), "precision": precision.as_str(), "dataset": path, "model": model,
         "features": features, "target": target, "seed": seed,
         "train_rows": train.len(), "fit_rows": fit.len(), "validation_rows": validation.len(), "test_rows": test.len(),
         "context_strategy": strategy.as_str(),
@@ -567,7 +581,7 @@ fn evaluate(task: Task, size: ModelSize, seed: u64) -> EvalResult<Value> {
 fn main() -> EvalResult<()> {
     let mut args = std::env::args().skip(1);
     let mut seed = 42;
-    let mut size = "both".to_string();
+    let mut size = "medium".to_string();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().ok_or("missing --seed value")?.parse()?,
@@ -581,17 +595,20 @@ fn main() -> EvalResult<()> {
         vec![ModelSize::parse(&size)?]
     };
     for size in sizes {
-        let mut results = Vec::new();
-        for task in [Task::Classification, Task::Regression] {
-            results.push(evaluate(task, size, seed)?);
+        for precision in [Precision::Fp16, Precision::Fp8, Precision::Int4] {
+            let model = size.model_path(Task::Classification, precision);
+            if !Path::new(&model).exists() {
+                continue;
+            }
+            let result = evaluate(Task::Classification, size, precision, seed)?;
+            let output = format!("output/{}-{}-evaluation-rust.json", size.as_str(), precision.as_str());
+            let text = serde_json::to_string_pretty(&result)?;
+            if let Some(parent) = Path::new(&output).parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&output, format!("{text}\n"))?;
+            println!("{} {} report: {output}\n{text}", size.as_str(), precision.as_str());
         }
-        let output = format!("output/{}-evaluation-rust.json", size.as_str());
-        let text = serde_json::to_string_pretty(&results)?;
-        if let Some(parent) = Path::new(&output).parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&output, format!("{text}\n"))?;
-        println!("{} report: {output}\n{text}", size.as_str());
     }
     Ok(())
 }
@@ -664,36 +681,30 @@ mod tests {
     }
 
     #[test]
-    fn model_paths_cover_both_tasks_and_sizes() {
-        for task in [Task::Classification, Task::Regression] {
-            for size in [ModelSize::Small, ModelSize::Medium] {
-                assert!(size.model_path(task).ends_with("-fp16.onnx"));
-                assert!(size.model_path(task).contains(size.as_str()));
-                assert!(size.model_path(task).starts_with(size.as_str()));
-            }
+    fn model_paths_cover_supported_precisions() {
+        for precision in [Precision::Fp16, Precision::Fp8, Precision::Int4] {
+            let path = ModelSize::Medium.model_path(Task::Classification, precision);
+            assert!(path.ends_with(&format!("-{}.onnx", precision.as_str())));
+            assert!(path.starts_with("medium/"));
         }
     }
 
     #[test]
-    #[ignore = "requires local small/medium FP16 ONNX models and ORT_DYLIB_PATH; run with --ignored"]
-    fn quantized_models_evaluate_both_sizes_and_datasets() {
-        assert!(
-            std::env::var_os("ORT_DYLIB_PATH").is_some(),
-            "set ORT_DYLIB_PATH before running this test"
-        );
-        for size in [ModelSize::Small, ModelSize::Medium] {
-            for task in [Task::Classification, Task::Regression] {
-                assert!(
-                    Path::new(size.model_path(task)).exists(),
-                    "missing model: {}",
-                    size.model_path(task)
-                );
-                let result = evaluate(task, size, 42).expect("FP16 inference should succeed");
-                assert_eq!(result["size"], size.as_str());
-                assert_eq!(result["precision"], "fp16");
-                assert!(result["test_rows"].as_u64().unwrap() > 0);
-                assert!(result["metrics"].is_object());
-            }
+    #[ignore = "requires local medium FP16/FP8/INT4 classification ONNX models and ORT_DYLIB_PATH; run with --ignored"]
+    fn quantized_models_evaluate_dataset_and_write_reports() {
+        assert!(std::env::var_os("ORT_DYLIB_PATH").is_some(), "set ORT_DYLIB_PATH before running this test");
+        for precision in [Precision::Fp16, Precision::Fp8, Precision::Int4] {
+            let model = ModelSize::Medium.model_path(Task::Classification, precision);
+            assert!(Path::new(&model).exists(), "missing model: {model}");
+            let result = evaluate(Task::Classification, ModelSize::Medium, precision, 42)
+                .expect("quantized classification inference should succeed");
+            assert_eq!(result["size"], "medium");
+            assert_eq!(result["precision"], precision.as_str());
+            assert!(result["test_rows"].as_u64().unwrap() > 0);
+            assert!(result["metrics"].is_object());
+            let output = format!("output/medium-{}-evaluation-rust.json", precision.as_str());
+            fs::create_dir_all("output").unwrap();
+            fs::write(&output, format!("{}\n", serde_json::to_string_pretty(&result).unwrap())).unwrap();
         }
     }
 }

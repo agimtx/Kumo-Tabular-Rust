@@ -179,64 +179,66 @@ unstable at 16 rows. The 16/32/64 comparison reuses the same test split: it is
 an exploratory granularity study, **not** independent validation of a
 context-size choice. For a final selected setting, evaluate on a fresh holdout.
 
-## Official medium Python comparison
+## Quantization comparison against original PyTorch checkpoints
 
-The local original medium checkpoints `pt/classifier.pt` and `pt/regressor.pt`
-were loaded into the official `structured-data-models==0.2.1` API (PyTorch
-2.7.1, CPU, FP32). The Rust medium evaluator uses the corrected FP16 exports,
-with `--seed 42 --context-rows 32 --trace`; the official API received **the same
-context and query row indices in every batch**, with `num_estimators=1` and its
-own default recipe. Each pipeline fitted its classification threshold using
-its own validation predictions and balanced accuracy. On the identical held-out
-rows:
+The original medium FP32 weights in `pt/classifier.pt` and `pt/regressor.pt`
+are loaded into the official `structured-data-models==0.2.1` API (PyTorch
+2.7.1, CPU). Each ONNX quantization level (FP16, FP8, INT4) is evaluated by
+Rust on the same dataset split (`seed=42`, 32 context rows), then the official
+`.pt` model is replayed on the exact same context/query row batches. Classification
+thresholds are selected independently on each pipeline's validation predictions
+using balanced accuracy. All metrics below use held-out test rows (344
+classification, 301 regression). Differences are **official FP32 minus ONNX**;
+positive MAE/RMSE means the official model has larger error, while positive R2,
+AUC, balanced accuracy, accuracy, or F1 means it scores higher.
 
-| Metric | Rust FP16 | Official Python FP32 | Difference (Python - Rust) |
-| --- | ---: | ---: | ---: |
-| Classification ROC AUC | 0.6740 | 0.6557 | -0.0183 |
-| Classification balanced accuracy | 0.6227 | 0.6175 | -0.0052 |
-| Classification accuracy | 0.6483 | 0.6192 | -0.0291 |
-| Regression MAE | 2.9421 | 2.9675 | +0.0254 |
-| Regression RMSE | 3.9460 | 4.0062 | +0.0602 |
+| Task | ONNX precision | ONNX MAE / AUC | ONNX RMSE / balanced accuracy | ONNX R2 / accuracy | Official MAE / AUC | Official RMSE / balanced accuracy | Official R2 / accuracy | Difference (official - ONNX), MAE / AUC | Difference, RMSE / balanced accuracy | Difference, R2 / accuracy |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Classification | FP16 | - / 0.6740 | - / 0.6227 | - / 0.6483 | - / 0.6557 | - / 0.6175 | - / 0.6192 | - / -0.0183 | - / -0.0052 | - / -0.0291 |
+| Classification | FP8 | - / 0.6715 | - / 0.6016 | - / 0.5116 | - / 0.6557 | - / 0.6175 | - / 0.6192 | - / -0.0158 | - / +0.0159 | - / +0.1076 |
+| Classification | INT4 | - / 0.4274 | - / 0.4567 | - / 0.2151 | - / 0.6557 | - / 0.6175 | - / 0.6192 | - / +0.2282 | - / +0.1608 | - / +0.4041 |
+| Regression | FP16 | 2.9421 / - | 3.9460 / - | 0.6783 / - | 2.9675 / - | 4.0062 / - | 0.6684 / - | +0.0254 / - | +0.0602 / - | -0.0099 / - |
+| Regression | FP8 | 3.0223 / - | 4.0427 / - | 0.6624 / - | 2.9675 / - | 4.0062 / - | 0.6684 / - | -0.0548 / - | -0.0365 / - | +0.0061 / - |
+| Regression | INT4 | 5.6742 / - | 6.9951 / - | -0.0108 / - | 2.9675 / - | 4.0062 / - | 0.6684 / - | -2.7067 / - | -2.9889 / - | +0.6793 / - |
 
-The high-level predictions are not expected to match row by row: the Rust and
-Python recipes independently draw random feature permutations and sign flips,
-so the models receive different tensors even though context/query row indices
-match. Those metrics measure two randomized end-to-end pipelines, not model
-numerical parity. To isolate inference, Rust `--trace` now records the exact
-prepared `x`, `y`, categorical mask, raw ONNX outputs, and target/class inverse
-transform metadata for every batch. `scripts/check_prepared_core_parity.py`
-feeds those same tensors to the official FP32 `_KumoTabular` core. On the 344
-classification test rows, Rust and PyTorch log-odds have mean absolute
-prediction difference `0.00092`, maximum `0.0122`, and correlation `0.9999989`.
-On 301 regression rows, median predictions differ by `0.00356` on average
-(maximum `0.0346`) with correlation `0.9999996`. The raw core-output mean
-absolute errors are also available in
-`output/medium-{classification,regression}-context-32-prepared-core-parity.json`.
-These small residuals are consistent with FP16 ONNX weights; the prior `0.902`
-and `0.986` correlations came from comparing different randomized recipe
-inputs. The earlier faulty-export metrics are obsolete.
+The `.pt` metrics repeat for all three rows because this is the same FP32
+checkpoint and its input batches are fixed; the differences isolate the result
+of each ONNX model/pipeline against that baseline. FP16 and FP8 regression are
+close to the original model on these metrics. INT4 regression degrades sharply
+(MAE 5.674 versus 2.967 and R2 -0.011 versus 0.668). For classification,
+FP16/FP8 ranking AUC is close to the baseline, while INT4 falls to 0.427. All
+classification accuracies are below the all-No baseline of 0.8866, so accuracy
+alone is not informative for this imbalanced dataset.
 
-To reproduce the high-level official API comparison after installing the
-package and dependencies into the isolated `.venv-official` Python environment:
+This is an end-to-end comparison, **not a pure weight-quantization error test**:
+Rust and Python use different recipe RNGs and arithmetic paths, although they
+receive the same context/query row indices. Prediction-level Pearson
+correlation and MAE are stored in the comparison JSON files. The lower
+classification INT4 correlation and regression INT4 correlation indicate a
+substantial prediction change beyond small floating-point rounding. Rust
+reports include held-out predictions and are task/precision-specific.
+
+Run all Rust reports (DuckDB CLI, ONNX Runtime dynamic library, and the six
+medium ONNX models are required), then run the original `.pt` comparison for
+each task and precision:
 
 ```sh
 CARGO_HOME="$PWD/.cargo-home" ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
   cargo run --locked --offline --release --bin evaluate_full -- \
-  --seed 42 --size medium --context-rows 32 --trace
-OMP_NUM_THREADS=4 .venv-official/bin/python scripts/compare_official_medium.py \
-  --task classification --seed 42 --context-rows 32
-OMP_NUM_THREADS=4 .venv-official/bin/python scripts/compare_official_medium.py \
-  --task regression --seed 42 --context-rows 32
-OMP_NUM_THREADS=4 .venv-official/bin/python scripts/check_prepared_core_parity.py \
-  --task classification --split test --seed 42 --context-rows 32
-OMP_NUM_THREADS=4 .venv-official/bin/python scripts/check_prepared_core_parity.py \
-  --task regression --split test --seed 42 --context-rows 32
+  --seed 42 --size medium --trace
+for task in classification regression; do
+  for precision in fp16 fp8 int4; do
+    OMP_NUM_THREADS=4 .venv-official/bin/python scripts/compare_official_medium.py \
+      --task "$task" --precision "$precision" --seed 42 --context-rows 32
+  done
+done
 ```
 
-This controls rows, labels, model size, and estimator count, **not** recipe
-randomness or arithmetic precision: Rust uses its own RNG and FP16 ONNX
-weights, while the official Python code uses PyTorch RNG, its exact recipe,
-and FP32 checkpoints. The exported core network was separately checked on
+Rust reports are `output/medium-{classification,regression}-{fp16,fp8,int4}-full-evaluation-rust.json`;
+original checkpoint comparison reports are
+`output/medium-{classification,regression}-{fp16,fp8,int4}-official-comparison.json`.
+The separate `scripts/check_prepared_core_parity.py` remains the tool for
+checking raw core inference on identical prepared tensors.
 identical tensors against PyTorch; at 32 contexts, mean absolute output error is
 0.00165 for classification logits and 0.00020 for regression quantiles, with
 correlations above 0.999999. This isolates the former large gap to a legacy
