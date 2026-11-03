@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import onnx
 import numpy as np
+import ml_dtypes
 import torch
 import torch.nn.functional as functional
 
@@ -254,14 +255,7 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                     values.astype(np.float16), name=name + "_fp16"
                 )
             elif quantization == "fp8":
-                encoded = np.fromiter(
-                    (
-                        onnx.helper.float32_to_float8e4m3(float(value), saturate=True)
-                        for value in values.astype(np.float32).reshape(-1)
-                    ),
-                    dtype=np.uint8,
-                    count=values.size,
-                ).reshape(values.shape)
+                encoded = values.astype(ml_dtypes.float8_e4m3fn).view(np.uint8)
                 compressed = onnx.helper.make_tensor(
                     name=name + "_fp8", data_type=TensorProto.FLOAT8E4M3FN,
                     dims=values.shape, vals=encoded.tobytes(), raw=True,
