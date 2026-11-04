@@ -208,7 +208,9 @@ def latency_table(rows: list[dict], task: str) -> list[str]:
 def model_size_table(rows: list[dict]) -> list[str]:
     sizes = {}
     for row in rows:
-        path = ROOT / row["rust"]["model"]
+        suffix = {"fp16": "f16", "fp8": "f8", "int4": "i4"}[row["precision"]]
+        task = "cls" if row["task"] == "classification" else "reg"
+        path = ROOT / "models" / f"tabular-{task}-medium-{suffix}.onnx"
         sizes[(row["task"], row["precision"])] = path.stat().st_size / (1024 * 1024)
     lines = [
         "| Task | FP16 | FP8 | INT4 |",
@@ -275,7 +277,7 @@ def main() -> None:
         "",
         "## Protocol",
         "",
-        f"Rust reads `models/kumo-tabular-medium-{{task}}-dynamic-{{fp16,fp8,int4}}.onnx`; "
+        f"Rust reads `models/tabular-{{cls,reg}}-medium-{{f16,f8,i4}}.onnx`; "
         f"the official API loads `pt/classifier.pt` or `pt/regressor.pt`. Each context "
         f"size is a separate run with a seed-{SEED} stratified 80/20 train/test split and "
         f"20% of the training rows held out for validation. Context rows are sampled "

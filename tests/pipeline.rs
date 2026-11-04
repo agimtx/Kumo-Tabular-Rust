@@ -148,11 +148,11 @@ fn predictor_rejects_missing_context_feature_rows_before_loading_model() {
 }
 
 #[test]
-#[ignore = "requires models/kumo-tabular-medium-classification-dynamic-fp16.onnx and ORT_DYLIB_PATH; run with --ignored"]
+#[ignore = "requires models/tabular-cls-medium-f16.onnx and ORT_DYLIB_PATH; run with --ignored"]
 fn dynamic_medium_model_accepts_16_context_rows() {
     use std::time::Instant;
 
-    let model = "models/kumo-tabular-medium-classification-dynamic-fp16.onnx";
+    let model = "models/tabular-cls-medium-f16.onnx";
     assert!(
         std::env::var_os("ORT_DYLIB_PATH").is_some(),
         "set ORT_DYLIB_PATH before running this test"

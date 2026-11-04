@@ -1,4 +1,4 @@
-"""Compare local medium FP32 cores against corrected dynamic FP16 ONNX graphs."""
+"""Compare local medium FP32 cores against original-weight dynamic FP32 ONNX graphs."""
 
 import argparse
 from pathlib import Path
@@ -14,12 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 TASKS = {
     "classification": {
         "checkpoint": "pt/classifier.pt",
-        "onnx": "medium/kumo-tabular-medium-classification-dynamic-fp16.onnx",
+        "onnx": "models/tabular-cls-medium-f32.onnx",
         "features": 13,
     },
     "regression": {
         "checkpoint": "pt/regressor.pt",
-        "onnx": "medium/kumo-tabular-medium-regression-dynamic-fp16.onnx",
+        "onnx": "models/tabular-reg-medium-f32.onnx",
         "features": 5,
     },
 }

@@ -6,6 +6,7 @@ import numpy as np
 
 from export_onnx import (
     REGRESSION_HEAD_WEIGHT,
+    model_filename,
     int4_group_size_for_task,
     keep_int4_weight_fp32,
     pack_int4,
@@ -16,6 +17,16 @@ from check_quantized_weights import decode_int4
 
 
 class Int4QuantizationTests(unittest.TestCase):
+    def test_canonical_filename_covers_original_and_compressed_weights(self) -> None:
+        self.assertEqual(model_filename("classification", "small", "fp32"),
+                         "tabular-cls-small-f32.onnx")
+        self.assertEqual(model_filename("regression", "medium", "fp16"),
+                         "tabular-reg-medium-f16.onnx")
+        self.assertEqual(model_filename("classification", "large", "fp8"),
+                         "tabular-cls-large-f8.onnx")
+        self.assertEqual(model_filename("regression", "large", "int4"),
+                         "tabular-reg-large-i4.onnx")
+
     def test_default_groups_only_change_regression(self) -> None:
         self.assertEqual(int4_group_size_for_task("regression", None), 16)
         self.assertEqual(int4_group_size_for_task("classification", None), 0)

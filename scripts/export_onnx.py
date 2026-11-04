@@ -1,6 +1,7 @@
-"""Export the tensor-level Kumo Tabular classifier or regressor to ONNX."""
+"""Export the original FP32 Kumo Tabular core or compressed weights to ONNX."""
 
 import argparse
+import hashlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -178,6 +179,13 @@ def fix_sdpa_key_length_gathers(graph: onnx.ModelProto, size: str) -> None:
 
 INT4_MIN_MATRIX_ELEMENTS = 4096
 REGRESSION_HEAD_WEIGHT = "model.icl_block.head.2.weight"
+PRECISION_SUFFIX = {"fp32": "f32", "fp16": "f16", "fp8": "f8", "int4": "i4"}
+TASK_SUFFIX = {"classification": "cls", "regression": "reg"}
+
+
+def model_filename(task: str, size: str, precision: str) -> str:
+    """Name an export by task, upstream model size and stored weight precision."""
+    return f"tabular-{TASK_SUFFIX[task]}-{size}-{PRECISION_SUFFIX[precision]}.onnx"
 
 
 def keep_int4_weight_fp32(name: str, task: str) -> bool:
@@ -233,6 +241,12 @@ def unpack_int4(values: np.ndarray, count: int) -> np.ndarray:
 
 def export(checkpoint: Path, output: Path, size: str, task: str, quantization: str,
            int4_group_size: int | None = None) -> None:
+    if quantization not in PRECISION_SUFFIX:
+        raise ValueError(f"unsupported weight precision: {quantization}")
+    if output.name != model_filename(task, size, quantization):
+        raise ValueError(f"output filename must be {model_filename(task, size, quantization)}")
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"missing {size} {task} checkpoint: {checkpoint}")
     classifier = task == "classification"
     group_size = int4_group_size_for_task(task, int4_group_size) if quantization == "int4" else 0
     model = _KumoTabular(
@@ -300,6 +314,9 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
                 continue
             name = weight.name
             values = numpy_helper.to_array(weight)
+            if quantization == "fp32":
+                # Keep the exact FP32 initializers produced from the official checkpoint.
+                continue
             if quantization == "fp16":
                 compressed = numpy_helper.from_array(
                     values.astype(np.float16), name=name + "_fp16"
@@ -418,6 +435,23 @@ def export(checkpoint: Path, output: Path, size: str, task: str, quantization: s
             )
         for cast in reversed(casts):
             graph.graph.node.insert(0, cast)
+        checkpoint_hash = hashlib.sha256()
+        with checkpoint.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                checkpoint_hash.update(chunk)
+        metadata = {
+            "checkpoint_sha256": checkpoint_hash.hexdigest(),
+            "checkpoint_file": checkpoint.name,
+            "model_size": size,
+            "task": task,
+            "weight_storage": quantization,
+            "compute_dtype": "float32",
+            "int4_group_size": str(group_size) if quantization == "int4" else "not_applicable",
+            "int4_min_matrix_elements": str(INT4_MIN_MATRIX_ELEMENTS) if quantization == "int4" else "not_applicable",
+            "int4_regression_head_fp32": str(task == "regression" and quantization == "int4").lower(),
+        }
+        for key, value in metadata.items():
+            graph.metadata_props.add(key=key, value=value)
         onnx.save_model(
             graph,
             str(output),
@@ -437,17 +471,18 @@ def main() -> None:
         "--task", required=True, choices=("classification", "regression")
     )
     parser.add_argument(
-        "--quantization", choices=("fp16", "fp8", "int4"), default="fp16"
+        "--quantization", choices=tuple(PRECISION_SUFFIX), default="fp32"
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path, help="Output directory (default: models/)")
     parser.add_argument("--int4-group-size", type=int,
                         help="Input-channel group width (default: regression 16, classification 0; 0 uses per-output-channel scales)")
     args = parser.parse_args()
     if args.int4_group_size is not None and (args.int4_group_size < 0 or args.quantization != "int4"):
         parser.error("--int4-group-size requires INT4 and a nonnegative group width")
-    export(args.checkpoint, args.output, args.size, args.task, args.quantization,
-           args.int4_group_size)
+    output_dir = args.output if args.output is not None else Path("models")
+    export(args.checkpoint, output_dir / model_filename(args.task, args.size, args.quantization),
+           args.size, args.task, args.quantization, args.int4_group_size)
 
 
 if __name__ == "__main__":

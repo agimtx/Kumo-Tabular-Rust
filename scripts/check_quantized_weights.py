@@ -3,8 +3,8 @@
 Every INT4 matrix is reconstructed from its packed nibbles and per-group
 scales.  Named initializers are matched to the FP32 state dict by key; the
 anonymous ``onnx::MatMul_*`` tensors are matched by shape and dequantized-value
-similarity.  The FP16 export is a lossless reference for all remaining
-tensors, so coverage and per-layer error can be reported for the whole model.
+similarity. The FP32 ONNX export is the original-weight reference for all
+remaining tensors, so coverage and per-layer error can be reported.
 """
 
 import argparse
@@ -15,6 +15,8 @@ import numpy as np
 import onnx
 import torch
 from onnx import numpy_helper
+
+from export_onnx import model_filename
 
 ROOT = Path(__file__).resolve().parents[1]
 TASKS = {
@@ -101,17 +103,17 @@ def main() -> None:
     parser.add_argument("--size", default="medium")
     args = parser.parse_args()
 
-    model_path = ROOT / "models" / f"kumo-tabular-{args.size}-{args.task}-dynamic-{args.precision}.onnx"
-    fp16_path = ROOT / "models" / f"kumo-tabular-{args.size}-{args.task}-dynamic-fp16.onnx"
+    model_path = ROOT / "models" / model_filename(args.task, args.size, args.precision)
+    reference_path = ROOT / "models" / model_filename(args.task, args.size, "fp32")
     state = torch.load(ROOT / "pt" / TASKS[args.task], map_location="cpu", weights_only=True)
     state = {key: value.float().numpy() for key, value in state.items()}
-    lossless, _ = load_onnx_weights(fp16_path)
+    lossless, _ = load_onnx_weights(reference_path)
     values_by_name, was_quantized = load_onnx_weights(model_path)
     # Drop helper constants that only exist in the quantized graph.
     values_by_name = {k: v for k, v in values_by_name.items() if k in lossless}
 
     records = []
-    matched_pt = anonymous = matched_fp16 = 0
+    matched_pt = anonymous = matched_fp32 = 0
     for name, values in values_by_name.items():
         record = {"tensor": name, "shape": list(values.shape),
                   "precision_weight": bool(was_quantized.get(name, False))}
@@ -133,8 +135,8 @@ def main() -> None:
                 anonymous += 1
             else:
                 record.update(errors(values, lossless[name]))
-                record["reference"] = "fp16-onnx"
-                matched_fp16 += 1
+                record["reference"] = "fp32-onnx"
+                matched_fp32 += 1
         records.append(record)
 
     quantized_records = [r for r in records if r["precision_weight"]]
@@ -151,7 +153,7 @@ def main() -> None:
         "fp32_retained_tensors": len(records) - len(quantized_records),
         "named_pt_matches": matched_pt,
         "anonymous_shape_matches": anonymous,
-        "fp16_reference_matches": matched_fp16,
+        "fp32_reference_matches": matched_fp32,
         "relative_l2_mean": float(relative.mean()),
         "relative_l2_median": float(np.median(relative)),
         "relative_l2_p95": float(np.percentile(relative, 95)),

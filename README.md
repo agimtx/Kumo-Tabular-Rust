@@ -10,7 +10,7 @@ FFI is not included yet.
 | Path | Contents |
 | --- | --- |
 | `src/` | Library and the `evaluate_full` benchmark CLI |
-| `models/` | Medium dynamic ONNX exports: FP16, FP8 and INT4 |
+| `models/` | Dynamic ONNX exports: original FP32, FP16, FP8 and INT4 weights (currently medium) |
 | `pt/` | Official FP32 PyTorch checkpoints (`classifier.pt`, `regressor.pt`) |
 | `dataset/` | Classification and regression Parquet datasets |
 | `scripts/` | Export, comparison and report tooling |
@@ -61,17 +61,24 @@ bit-for-bit Python parity. Relevant upstream code:
 ## Export ONNX
 
 Run the **Export Kumo Tabular ONNX** GitHub Action and choose the model size,
-task and weight precision (`fp16`, `fp8`, `int4`, or `all`). It downloads the
-matching NVIDIA checkpoint and uploads the dynamic `.onnx` artifact. Keep a
-generated `.onnx.data` file beside its model.
+task and weight precision (`fp32`, `fp16`, `fp8`, `int4`, or `all`). It downloads the
+matching NVIDIA FP32 checkpoint and uploads the dynamic `.onnx` artifact. Keep a
+generated `.onnx.data` file beside its model. The canonical filename is
+`tabular-{cls|reg}-{small|medium|large}-{f32|f16|f8|i4}.onnx`;
+`f32` retains the original checkpoint weights, while the smaller variants
+compress weight storage and decode to FP32 for computation. Each export records
+its checkpoint SHA-256, task, size and weight-storage precision in ONNX metadata
+for newly generated exports; the six renamed legacy compressed exports predate
+this metadata. INT4 also records its task-dependent group width (classification:
+per output channel; regression: 16 input channels).
 
 Local export:
 
 ```sh
 python -m pip install 'torch>=2.7' structured-data-models onnx
 python scripts/export_onnx.py --size medium --task classification \
-  --checkpoint pt/classifier.pt --quantization fp16 \
-  --output models/kumo-tabular-medium-classification-dynamic-fp16.onnx
+  --checkpoint pt/classifier.pt --quantization fp32 --output models
+# writes models/tabular-cls-medium-f32.onnx
 ```
 
 INT4 stores matrix weights in signed 4-bit groups and converts them to FP32 for
@@ -85,7 +92,7 @@ cargo test
 ```
 
 Unit tests do not need ONNX Runtime. The ignored integration test loads
-`models/kumo-tabular-medium-classification-dynamic-fp16.onnx`:
+`models/tabular-cls-medium-f16.onnx`:
 
 ```sh
 ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
@@ -155,7 +162,7 @@ All ONNX files are medium dynamic exports under `models/`; every official compar
 
 ### Protocol
 
-Rust reads `models/kumo-tabular-medium-{task}-dynamic-{fp16,fp8,int4}.onnx`; the official API loads `pt/classifier.pt` or `pt/regressor.pt`. Each context size is a separate run with a seed-42 stratified 80/20 train/test split and 20% of the training rows held out for validation. Context rows are sampled class-balanced for classification and uniformly for regression; every batch contains the configured context (16, 32 or 64 rows) plus up to 2 query rows. The classifier threshold is fitted on validation balanced accuracy; regression uses the median of 999 quantiles. Metrics use held-out test rows only.
+Rust reads `models/tabular-{cls,reg}-medium-{f16,f8,i4}.onnx`; the official API loads `pt/classifier.pt` or `pt/regressor.pt`. Each context size is a separate run with a seed-42 stratified 80/20 train/test split and 20% of the training rows held out for validation. Context rows are sampled class-balanced for classification and uniformly for regression; every batch contains the configured context (16, 32 or 64 rows) plus up to 2 query rows. The classifier threshold is fitted on validation balanced accuracy; regression uses the median of 999 quantiles. Metrics use held-out test rows only.
 
 Latency is wall time per batch on CPU: ONNX is the `session.run` call, PT is one official API call (which includes its recipe). The first call is included, so mean and p95 include warm-up. ONNX and PT latency are indicative, not a framework-only microbenchmark. PT latency repeats within a context size because one FP32 replay serves all three precision comparisons.
 

@@ -354,11 +354,14 @@ fn evaluate(
     };
     let model = model_override.map(str::to_owned).unwrap_or_else(|| {
         format!(
-            "models/kumo-tabular-{size}-{}-dynamic-{precision}.onnx",
-            if classification {
-                "classification"
-            } else {
-                "regression"
+            "models/tabular-{}-{size}-{}.onnx",
+            if classification { "cls" } else { "reg" },
+            match precision {
+                "fp32" => "f32",
+                "fp16" => "f16",
+                "fp8" => "f8",
+                "int4" => "i4",
+                _ => unreachable!("precision is validated before evaluation"),
             }
         )
     });
@@ -540,11 +543,12 @@ fn main() -> EvalResult<()> {
         _ => return Err("task must be classification, regression or both".into()),
     };
     let precisions: Vec<&str> = match precision_filter.as_str() {
-        "all" => vec!["fp16", "fp8", "int4"],
+        "all" => vec!["fp32", "fp16", "fp8", "int4"],
+        "fp32" => vec!["fp32"],
         "fp16" => vec!["fp16"],
         "fp8" => vec!["fp8"],
         "int4" => vec!["int4"],
-        _ => return Err("precision must be fp16, fp8, int4 or all".into()),
+        _ => return Err("precision must be fp32, fp16, fp8, int4 or all".into()),
     };
     if (model_override.is_some() || report_override.is_some())
         && (sizes.len() != 1 || tasks.len() != 1 || precisions.len() != 1)
@@ -564,7 +568,21 @@ fn main() -> EvalResult<()> {
             let mut report = Vec::new();
             for &(name, task) in &tasks {
                 let model = model_override.clone().unwrap_or_else(|| {
-                    format!("models/kumo-tabular-{size}-{name}-dynamic-{precision}.onnx")
+                    format!(
+                        "models/tabular-{}-{size}-{}.onnx",
+                        if name == "classification" {
+                            "cls"
+                        } else {
+                            "reg"
+                        },
+                        match precision {
+                            "fp32" => "f32",
+                            "fp16" => "f16",
+                            "fp8" => "f8",
+                            "int4" => "i4",
+                            _ => unreachable!(),
+                        }
+                    )
                 });
                 if !Path::new(&model).is_file() {
                     continue;

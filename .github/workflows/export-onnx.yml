@@ -23,9 +23,10 @@ on:
       quantization:
         description: Weight storage precision
         required: true
-        default: fp16
+        default: fp32
         type: choice
         options:
+          - fp32
           - fp16
           - fp8
           - int4
@@ -66,12 +67,12 @@ jobs:
         run: |
           if [ "$TASK" = classification ]; then file=classifier.pt; else file=regressor.pt; fi
           mkdir -p output
-          if [ "$QUANTIZATION" = all ]; then quantizations="fp16 fp8 int4"; else quantizations="$QUANTIZATION"; fi
+          if [ "$QUANTIZATION" = all ]; then quantizations="fp32 fp16 fp8 int4"; else quantizations="$QUANTIZATION"; fi
           for quantization in $quantizations; do
             python scripts/export_onnx.py \
               --size "$SIZE" --task "$TASK" --quantization "$quantization" \
               --checkpoint "checkpoints/${file}" \
-              --output "output/kumo-tabular-${SIZE}-${TASK}-dynamic-${quantization}.onnx"
+              --output output
           done
       - name: Validate dynamic input shapes with ONNX Runtime
         env:
@@ -80,14 +81,21 @@ jobs:
           QUANTIZATION: ${{ inputs.quantization }}
         run: |
           python -m pip install onnxruntime numpy
-          if [ "$QUANTIZATION" = all ]; then quantizations="fp16 fp8 int4"; else quantizations="$QUANTIZATION"; fi
+          if [ "$QUANTIZATION" = all ]; then quantizations="fp32 fp16 fp8 int4"; else quantizations="$QUANTIZATION"; fi
+          if [ "$TASK" = classification ]; then task_name=cls; else task_name=reg; fi
           for quantization in $quantizations; do
+            case "$quantization" in
+              fp32) precision=f32 ;;
+              fp16) precision=f16 ;;
+              fp8) precision=f8 ;;
+              int4) precision=i4 ;;
+            esac
             python scripts/validate_dynamic_onnx.py \
-              "output/kumo-tabular-${SIZE}-${TASK}-dynamic-${quantization}.onnx" --task "$TASK"
+              "output/tabular-${task_name}-${SIZE}-${precision}.onnx" --task "$TASK"
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: kumo-tabular-${{ inputs.size }}-${{ inputs.task }}-${{ inputs.quantization }}-onnx
+          name: tabular-${{ inputs.task }}-${{ inputs.size }}-${{ inputs.quantization }}-onnx
           path: output/
           if-no-files-found: error
           compression-level: 0
