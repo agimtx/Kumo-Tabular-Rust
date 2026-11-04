@@ -20,18 +20,35 @@ class PackageDynamicLibTests(unittest.TestCase):
 
         self.assertEqual(package.name, "libonnx-linux-x86_64")
         self.assertEqual((package / "include/onnx_ffi.h").read_text(), "/* public api */\n")
-        self.assertEqual((package / "lib/libonnx-linux-x86_64.so").read_bytes(), b"library")
+        self.assertEqual((package / "lib/libkumo-onnx-x86_64.so").read_bytes(), b"library")
         self.assertTrue((package / "BUILD_INFO.txt").is_file())
+        self.assertIn("Library: lib/libkumo-onnx-x86_64.so", (package / "BUILD_INFO.txt").read_text())
         deps = (package / "RUNTIME_DEPS.txt").read_text()
         self.assertIn("loaded dynamically", deps)
         self.assertIn("not linked", deps)
         self.assertIn("external", (package / "BUILD_INFO.txt").read_text())
 
+    def test_names_library_after_arch_with_platform_extension(self):
+        cases = (
+            ("linux", "x86_64", "libkumo-onnx-x86_64.so"),
+            ("macos", "aarch64", "libkumo-onnx-aarch64.dylib"),
+            ("windows", "x86_64", "libkumo-onnx-x86_64.dll"),
+        )
+        for platform, arch, library_name in cases:
+            with self.subTest(platform=platform):
+                package = package_library(
+                    self.source, self.header, self.root / "out", platform, arch
+                )
+                self.assertEqual(
+                    [entry.name for entry in (package / "lib").iterdir() if entry.is_file()],
+                    [library_name],
+                )
+
     def test_missing_header_fails_instead_of_packaging_incomplete_output(self):
         with self.assertRaises(FileNotFoundError):
             package_library(self.source, self.root / "missing.h", self.root / "out", "windows", "x86_64")
 
-    def test_bundles_onnxruntime_next_to_the_library(self):
+    def test_bundles_single_onnxruntime_under_canonical_name(self):
         runtime_dir = self.root / "runtime-lib"
         runtime_dir.mkdir()
         (runtime_dir / "libonnxruntime.so.1.23.0").write_bytes(b"onnxruntime")
@@ -51,16 +68,44 @@ class PackageDynamicLibTests(unittest.TestCase):
             onnxruntime_license=license_file,
         )
 
-        self.assertEqual((package / "lib/libonnxruntime.so.1.23.0").read_bytes(), b"onnxruntime")
-        self.assertTrue((package / "lib/libonnxruntime.so").is_symlink())
+        runtime = package / "lib/libonnxruntime.so"
+        self.assertEqual(runtime.read_bytes(), b"onnxruntime")
+        self.assertFalse(runtime.is_symlink())
+        self.assertFalse((package / "lib/libonnxruntime.so.1.23.0").exists())
         self.assertFalse((package / "lib/unrelated.txt").exists())
+        self.assertEqual(
+            sorted(
+                entry.name
+                for entry in (package / "lib").iterdir()
+                if "onnxruntime" in entry.name
+            ),
+            ["libonnxruntime.so"],
+        )
         self.assertTrue((package / "ONNXRUNTIME_LICENSE").is_file())
         deps = (package / "RUNTIME_DEPS.txt").read_text()
-        self.assertIn("ONNX Runtime 1.23.0 is bundled", deps)
+        self.assertIn("ONNX Runtime 1.23.0 is bundled in lib/libonnxruntime.so", deps)
         self.assertIn("ORT_DYLIB_PATH", deps)
         info = (package / "BUILD_INFO.txt").read_text()
         self.assertIn("ONNX Runtime: 1.23.0", info)
-        self.assertIn("libonnxruntime.so.1.23.0", info)
+        self.assertIn("libonnxruntime.so", info)
+
+    def test_renames_versioned_runtime_when_only_that_file_is_present(self):
+        runtime_dir = self.root / "runtime-versioned-only"
+        runtime_dir.mkdir()
+        (runtime_dir / "libonnxruntime.1.23.0.dylib").write_bytes(b"onnxruntime")
+
+        package = package_library(
+            self.source,
+            self.header,
+            self.root / "out",
+            "macos",
+            "aarch64",
+            onnxruntime_dir=runtime_dir,
+            onnxruntime_version="1.23.0",
+        )
+
+        self.assertEqual((package / "lib/libonnxruntime.dylib").read_bytes(), b"onnxruntime")
+        self.assertFalse((package / "lib/libonnxruntime.1.23.0.dylib").exists())
 
     def test_bundled_layout_matches_requested_platform_name(self):
         runtime_dir = self.root / "runtime-win"

@@ -53,6 +53,27 @@ jobs:
             --platform "${{ matrix.platform }}" \
             --arch "${{ matrix.arch }}" \
             --output "$RUNNER_TEMP/onnxruntime")
+          # Keep a single real library under the canonical name; drop the
+          # unversioned symlink shipped in the release archive.
+          case "${{ matrix.platform }}" in
+            macos)
+              target="$ROOT/lib/libonnxruntime.dylib"
+              source=$(ls "$ROOT/lib"/libonnxruntime.*.dylib)
+              ;;
+            linux)
+              target="$ROOT/lib/libonnxruntime.so"
+              source=$(ls "$ROOT/lib"/libonnxruntime.so.*)
+              ;;
+            windows)
+              target="$ROOT/lib/onnxruntime.dll"
+              source="$target"
+              ;;
+          esac
+          if [ "$source" != "$target" ]; then
+            rm -f "$target"
+            mv "$source" "$target"
+          fi
+          ls -l "$ROOT/lib"
           echo "ORT_ROOT=$ROOT" >> "$GITHUB_ENV"
       - name: Package library, header, and ONNX Runtime
         shell: bash
@@ -74,10 +95,10 @@ jobs:
           test -f "$package/include/onnx_ffi.h"
           test -f "$package/ONNXRUNTIME_LICENSE"
           shopt -s nullglob
-          libraries=("$package/lib"/libonnx-*)
+          libraries=("$package/lib"/libkumo-onnx-*)
           runtimes=("$package/lib"/*onnxruntime*)
-          test "${#libraries[@]}" -gt 0
-          test "${#runtimes[@]}" -gt 0
+          test "${#libraries[@]}" -eq 1
+          test "${#runtimes[@]}" -eq 1
       - name: Smoke test bundled ONNX Runtime
         shell: bash
         run: >-

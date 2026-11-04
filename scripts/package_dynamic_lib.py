@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 from pathlib import Path
 
 EXTENSIONS = {"linux": ".so", "windows": ".dll", "macos": ".dylib"}
+# Name of the packaged library, e.g. libkumo-onnx-x86_64.so.
+LIBRARY_STEM = "libkumo-onnx"
+ONNXRUNTIME_NAMES = {
+    "linux": "libonnxruntime.so",
+    "windows": "onnxruntime.dll",
+    "macos": "libonnxruntime.dylib",
+}
 
 
 def _is_onnxruntime_library(path: Path, platform: str) -> bool:
@@ -22,37 +28,42 @@ def _is_onnxruntime_library(path: Path, platform: str) -> bool:
 
 
 def _copy_onnxruntime(source: Path, destination: Path, platform: str) -> list[str]:
-    """Copy ONNX Runtime shared libraries, preserving versioned symlinks."""
+    """Copy exactly one ONNX Runtime library under its canonical file name.
+
+    Release archives ship a versioned real file plus an unversioned symlink;
+    bundles keep only the real file, renamed to the canonical name.
+    """
     if not source.is_dir():
         raise NotADirectoryError(f"ONNX Runtime library directory not found: {source}")
 
-    copied: list[str] = []
-    for entry in sorted(source.iterdir()):
-        if not _is_onnxruntime_library(entry, platform):
-            continue
-        target = destination / entry.name
-        if entry.is_symlink():
-            link_target = os.readlink(entry)
-            if target.is_symlink() or target.exists():
-                target.unlink()
-            os.symlink(link_target, target)
-        else:
-            shutil.copy2(entry, target)
-        copied.append(entry.name)
-
-    if not copied:
+    canonical_name = ONNXRUNTIME_NAMES[platform]
+    entries = sorted(
+        entry
+        for entry in source.iterdir()
+        if _is_onnxruntime_library(entry, platform) and entry.is_file()
+    )
+    if not entries:
         raise FileNotFoundError(
             f"no ONNX Runtime shared library for {platform} found in {source}"
         )
-    return copied
+
+    preferred = source / canonical_name
+    regular = [entry for entry in entries if not entry.is_symlink()]
+    if preferred in regular:
+        chosen = preferred
+    elif regular:
+        # Prefer the versioned file so the canonical name is not a stale copy.
+        chosen = max(regular, key=lambda entry: len(entry.name))
+    else:
+        chosen = entries[0]
+
+    shutil.copy2(chosen, destination / canonical_name)
+    return [canonical_name]
 
 
 def _runtime_notes(platform: str, onnxruntime_version: str | None) -> str:
     version = onnxruntime_version or "unknown"
-    if platform == "windows":
-        library_name = "onnxruntime.dll"
-    else:
-        library_name = f"libonnxruntime{EXTENSIONS[platform]}"
+    library_name = ONNXRUNTIME_NAMES[platform]
     return (
         f"ONNX Runtime {version} is bundled in lib/{library_name} and is loaded\n"
         "dynamically by this library on first use (ort load-dynamic); it is not\n"
@@ -98,6 +109,7 @@ def package_library(
         raise FileNotFoundError(f"ONNX Runtime license not found: {onnxruntime_license}")
 
     package_name = f"libonnx-{platform}-{arch}"
+    library_name = f"{LIBRARY_STEM}-{arch}{EXTENSIONS[platform]}"
     package_dir = output_root / package_name
     include_dir = package_dir / "include"
     lib_dir = package_dir / "lib"
@@ -105,7 +117,7 @@ def package_library(
     lib_dir.mkdir(parents=True, exist_ok=True)
 
     shutil.copy2(header, include_dir / "onnx_ffi.h")
-    shutil.copy2(source, lib_dir / f"{package_name}{EXTENSIONS[platform]}")
+    shutil.copy2(source, lib_dir / library_name)
 
     runtime_line = "ONNX Runtime: external (provided by the host)\n"
     if onnxruntime_dir is not None:
@@ -119,6 +131,7 @@ def package_library(
 
     (package_dir / "BUILD_INFO.txt").write_text(
         f"Package: {package_name}\n"
+        f"Library: lib/{library_name}\n"
         f"Platform: {platform}\nArchitecture: {arch}\n"
         "Build: GitHub Actions release cdylib\n"
         f"{runtime_line}",
