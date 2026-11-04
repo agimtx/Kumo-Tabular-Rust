@@ -52,6 +52,92 @@ void tabular_onnx_free_values(float *values, size_t rows, size_t columns);
 /* Destroy a model handle; NULL is accepted. */
 void tabular_onnx_destroy(TabularOnnxHandle *handle);
 
+/*
+ * High-level table API
+ * --------------------
+ *
+ * The functions below accept named columns of raw values and let Rust perform
+ * the Kumo recipe, target encoding and inference. They are the recommended
+ * entry point for hosts that do not already own a preprocessed tensor.
+ *
+ * A table is column-oriented. Numeric columns point at row_count doubles; NaN
+ * means missing. Categorical columns point at row_count UTF-8 C strings; NULL
+ * means missing. Every column name must be unique and non-empty. A table with
+ * only the target column is accepted as a univariate series; Rust supplies a
+ * deterministic row-index feature in that case.
+ *
+ * For predict_table, the first context_rows rows are labeled context and the
+ * remaining rows are queries. target_column names the label column; it may be
+ * numeric or categorical for classification and must be numeric for regression.
+ * The classification class set is inferred from the context rows, so every class
+ * to predict must appear in the context. Targets with more than ten classes are
+ * expanded with ECOC inside the library.
+ *
+ * For forecast, history rows are chronological and include the target column.
+ * The last context_rows rows are used as context. The optional future table
+ * supplies feature values for the horizon rows; when it is NULL, the last
+ * history row's feature values are repeated. The future target column, if
+ * present, is ignored. The handle has the same single-threaded contract as the
+ * tensor API: do not call prediction functions concurrently on one handle.
+ */
+enum {
+    TABULAR_ONNX_COLUMN_NUMERIC = 0,
+    TABULAR_ONNX_COLUMN_CATEGORICAL = 1
+};
+
+typedef struct {
+    const char *name;
+    int32_t kind; /* TABULAR_ONNX_COLUMN_* */
+    const double *numeric_values;
+    const char *const *category_values;
+} TabularOnnxColumn;
+
+typedef struct {
+    const TabularOnnxColumn *columns;
+    size_t column_count;
+    size_t row_count;
+} TabularOnnxTable;
+
+/*
+ * A prediction owns all pointers below. values is row-major:
+ *   classification: [rows, class_count] probabilities in class_labels order;
+ *   regression:     [rows, 3] median, q05 and q95 in original target units.
+ * quantiles is regression-only row-major [rows, quantile_count] (999), sorted
+ * and in original target units. class_labels is classification-only and holds
+ * class_count UTF-8 strings. Call tabular_onnx_prediction_free after use; the
+ * struct is zeroed and a second free call is safe.
+ */
+typedef struct {
+    int32_t task;
+    size_t rows;
+    size_t columns;
+    float *values;
+    size_t class_count;
+    char **class_labels;
+    size_t quantile_count;
+    float *quantiles;
+} TabularOnnxPrediction;
+
+int32_t tabular_onnx_predict_table(
+    TabularOnnxHandle *handle,
+    int32_t task,
+    const TabularOnnxTable *table,
+    size_t context_rows,
+    const char *target_column,
+    TabularOnnxPrediction *out_prediction);
+
+int32_t tabular_onnx_forecast(
+    TabularOnnxHandle *handle,
+    int32_t task,
+    const TabularOnnxTable *history,
+    size_t context_rows,
+    const char *target_column,
+    size_t horizon,
+    const TabularOnnxTable *future,
+    TabularOnnxPrediction *out_prediction);
+
+void tabular_onnx_prediction_free(TabularOnnxPrediction *prediction);
+
 /* Thread-local error text, valid until the next API call on this thread. */
 const char *tabular_onnx_last_error(void);
 

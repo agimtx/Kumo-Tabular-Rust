@@ -121,6 +121,56 @@ pub fn prepare(
     task: Task,
     rng: &mut StdRng,
 ) -> Result<Prepared, String> {
+    prepare_impl(
+        rows,
+        feature_names,
+        context_indices,
+        query_indices,
+        target_values,
+        task,
+        rng,
+        Some(10),
+    )
+}
+
+/// Like [`prepare`], but does not reject classification targets with more than
+/// ten classes. The returned labels are encoded class indices; use
+/// [`Prepared::class_permutation`] to map an encoded index back to the original
+/// numeric target value. Callers that run the exported ten-class core must
+/// encode those labels themselves (for example with the ECOC helper in
+/// [`crate::ecoc`]).
+pub fn prepare_any_classes(
+    rows: &[Vec<Value>],
+    feature_names: &[&str],
+    context_indices: &[usize],
+    query_indices: &[usize],
+    target_values: &[f64],
+    task: Task,
+    rng: &mut StdRng,
+) -> Result<Prepared, String> {
+    prepare_impl(
+        rows,
+        feature_names,
+        context_indices,
+        query_indices,
+        target_values,
+        task,
+        rng,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_impl(
+    rows: &[Vec<Value>],
+    feature_names: &[&str],
+    context_indices: &[usize],
+    query_indices: &[usize],
+    target_values: &[f64],
+    task: Task,
+    rng: &mut StdRng,
+    max_classes: Option<usize>,
+) -> Result<Prepared, String> {
     if target_values.len() != rows.len() {
         return Err("target values must align with rows".into());
     }
@@ -215,8 +265,10 @@ pub fn prepare(
     if task == Task::Classification && classes.is_empty() {
         return Err("classification target has no finite context labels".into());
     }
-    if classes.len() > 10 {
-        return Err("more than 10 classes require ECOC encoding".into());
+    if let Some(max_classes) = max_classes {
+        if classes.len() > max_classes {
+            return Err("more than 10 classes require ECOC encoding".into());
+        }
     }
     let class_offset = if classes.len() > 1 {
         let mut offsets = (0..classes.len()).collect::<Vec<_>>();
@@ -563,6 +615,37 @@ mod tests {
         assert!(prepared.x[(2, 0)].is_nan());
         assert_eq!(prepared.labels.len(), 2);
     }
+    #[test]
+    fn any_classes_allows_ecoc_sized_targets() {
+        let rows = (0..12).map(|index| vec![n(index)]).collect::<Vec<_>>();
+        let labels = (0..12).map(|index| (index % 11) as f64).collect::<Vec<_>>();
+        let context = (0..11).collect::<Vec<_>>();
+        let mut rng = StdRng::seed_from_u64(23);
+        assert!(prepare(
+            &rows,
+            &["x"],
+            &context,
+            &[11],
+            &labels,
+            Task::Classification,
+            &mut rng,
+        )
+        .is_err());
+        let mut rng = StdRng::seed_from_u64(23);
+        let prepared = prepare_any_classes(
+            &rows,
+            &["x"],
+            &context,
+            &[11],
+            &labels,
+            Task::Classification,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(prepared.labels.len(), 11);
+        assert_eq!(prepared.class_permutation.len(), 11);
+    }
+
     #[test]
     fn errors_on_bad_index() {
         let rows = vec![vec![n(1)]];

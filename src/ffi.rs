@@ -16,16 +16,23 @@ pub struct TabularOnnxHandle {
     session: OnnxSession,
 }
 
+impl TabularOnnxHandle {
+    /// Mutable access for the higher-level table ABI in `ffi_table`.
+    pub(crate) fn session_mut(&mut self) -> &mut OnnxSession {
+        &mut self.session
+    }
+}
+
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap());
 }
 
-fn set_error(message: impl ToString) {
+pub(crate) fn set_error(message: impl ToString) {
     let message = message.to_string().replace('\0', "\\0");
     LAST_ERROR.with(|slot| *slot.borrow_mut() = CString::new(message).unwrap());
 }
 
-fn ffi_result<T>(operation: impl FnOnce() -> crate::Result<T>) -> Result<T, i32> {
+pub(crate) fn ffi_result<T>(operation: impl FnOnce() -> crate::Result<T>) -> Result<T, i32> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => {
@@ -60,6 +67,11 @@ pub extern "C" fn tabular_onnx_last_error() -> *const c_char {
 /// Load an ONNX model. `model_path` must be a UTF-8, NUL-terminated path.
 /// ONNX Runtime is loaded from the `lib/` directory shipped next to this
 /// library, unless `ORT_DYLIB_PATH` points at another installation.
+///
+/// # Safety
+///
+/// `model_path` must be a readable NUL-terminated string. `out_handle` must be
+/// valid, writable, suitably aligned storage for one handle pointer.
 #[no_mangle]
 pub unsafe extern "C" fn tabular_onnx_create(
     model_path: *const c_char,
@@ -93,6 +105,14 @@ pub unsafe extern "C" fn tabular_onnx_create(
 /// On success, out_values owns a newly allocated row-major float32 array; release
 /// it with tabular_onnx_free_values. Outputs are logits (10 columns) or quantiles
 /// (999 columns).
+///
+/// # Safety
+///
+/// `handle` must come from `tabular_onnx_create`. `x`, `y`,
+/// `categorical_mask` and the three output pointers must reference enough
+/// readable/writable memory for the documented shapes; `x` is
+/// `total_rows * features` floats, `y` is `context_rows` floats and the mask is
+/// `features` bytes. The handle must not be used concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn tabular_onnx_predict(
     handle: *mut TabularOnnxHandle,
@@ -163,6 +183,11 @@ pub unsafe extern "C" fn tabular_onnx_predict(
 }
 
 /// Release a prediction array returned by tabular_onnx_predict.
+///
+/// # Safety
+///
+/// `values` must be null or a pointer returned by `tabular_onnx_predict`, with
+/// the same `rows` and `columns`. It must not be freed twice.
 #[no_mangle]
 pub unsafe extern "C" fn tabular_onnx_free_values(values: *mut f32, rows: usize, columns: usize) {
     if !values.is_null() {
@@ -173,6 +198,11 @@ pub unsafe extern "C" fn tabular_onnx_free_values(values: *mut f32, rows: usize,
 }
 
 /// Unload a handle returned by tabular_onnx_create. Null is accepted.
+///
+/// # Safety
+///
+/// `handle` must be null or a handle from `tabular_onnx_create` that is no
+/// longer used by any thread. It must not be destroyed twice.
 #[no_mangle]
 pub unsafe extern "C" fn tabular_onnx_destroy(handle: *mut TabularOnnxHandle) {
     if !handle.is_null() {

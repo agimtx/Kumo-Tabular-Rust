@@ -26,6 +26,61 @@ The crate builds both an Rust library and a C-compatible dynamic library. The pu
 
 The **Build dynamic libraries** GitHub Actions workflow (manual dispatch, `arch` input: `all`, `x86_64`, or `aarch64`) builds bundles for Linux x86_64, Windows x86_64, and macOS arm64. Each bundle contains `include/onnx_ffi.h`, the platform library at `lib/libkumo-onnx-{arch}` with the platform extension (`.so`, `.dll`, or `.dylib`), the pinned ONNX Runtime shared library as a single unversioned file (`libonnxruntime.so`, `libonnxruntime.dylib`, or `onnxruntime.dll`) in the same `lib/` directory (with `ONNXRUNTIME_LICENSE`), `BUILD_INFO.txt`, and `RUNTIME_DEPS.txt`. The library loads the bundled runtime from its own directory on first use, so hosts need no separate ONNX Runtime install; set `ORT_DYLIB_PATH` to override it with another build. Local builds still require `ORT_DYLIB_PATH` because they are not packaged with a runtime.
 
+### High-level table ABI
+
+For hosts that should not build tensors, `include/onnx_ffi.h` also exposes a
+column-oriented table API. A `TabularOnnxTable` holds named columns; numeric
+columns are `double` arrays (`NaN` = missing) and categorical columns are UTF-8
+string arrays (`NULL` = missing). The target column is named separately by
+`target_column`. A table containing only the target column is accepted as a
+univariate series; Rust adds a deterministic row-index feature.
+
+`tabular_onnx_predict_table` treats the first `context_rows` rows as labeled
+context and the rest as queries. Rust runs the Kumo recipe, target
+standardization, class encoding and model inference. Classification returns
+`[rows, class_count]` probabilities plus class labels; regression returns
+`[rows, 3]` median/q05/q95 plus the full sorted 999-quantile matrix in original
+target units.
+
+`tabular_onnx_forecast` takes chronological history rows and a horizon. The last
+`context_rows` history rows are the context. An optional future table supplies
+feature values for each horizon step; when it is absent the last history row's
+feature values are repeated. The future target column is ignored. This API is a
+horizon wrapper around the same table pipeline, not an automatic time-series
+feature generator: supply lag/rolling/calendar columns as ordinary features, and
+supply future rows when those features change over the horizon. This function
+returns the same probability/quantile structures as `predict_table`. Forecast is
+per series: call once per series, or include a series identifier as a
+categorical feature with enough context rows for each series.
+
+Classification class sets are inferred from the context target column, so every
+class to predict must appear in the context. For more than ten classes Rust
+builds an ECOC codebook, runs the required core tasks and aggregates their
+log-probabilities; callers see only the final class probabilities. All
+prediction memory is released with `tabular_onnx_prediction_free`, and a table
+handle remains single-threaded like the tensor API.
+
+A minimal C call looks like this; the arrays are owned by the caller and only
+borrowed for the duration of the call:
+
+```c
+TabularOnnxColumn columns[2] = {
+    { .name = "age", .kind = TABULAR_ONNX_COLUMN_NUMERIC,
+      .numeric_values = age, .category_values = NULL },
+    { .name = "target", .kind = TABULAR_ONNX_COLUMN_CATEGORICAL,
+      .numeric_values = NULL, .category_values = target },
+};
+TabularOnnxTable table = { columns, 2, rows };
+TabularOnnxPrediction prediction = { 0 };
+if (tabular_onnx_predict_table(handle, TABULAR_ONNX_CLASSIFICATION, &table,
+                               16, "target", &prediction) != TABULAR_ONNX_OK) {
+    /* tabular_onnx_last_error() has the reason. */
+}
+/* prediction.values is row-major probabilities; prediction.class_labels names
+   the columns. */
+tabular_onnx_prediction_free(&prediction);
+```
+
 ## Rust API
 
 `Table` is a typed, nullable, column-oriented input model. It converts to and

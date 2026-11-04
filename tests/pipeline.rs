@@ -193,3 +193,262 @@ fn dynamic_medium_model_accepts_16_context_rows() {
     assert_eq!(output.shape(), &[2, 10]);
     assert!(output.iter().all(|value| value.is_finite()));
 }
+
+#[test]
+#[ignore = "requires models/tabular-cls-medium-f16.onnx and ORT_DYLIB_PATH; run with --ignored"]
+fn high_level_table_api_classifies_without_tensors() {
+    use std::ffi::{CStr, CString};
+    use tabular_onnx::ffi::{tabular_onnx_create, tabular_onnx_destroy, tabular_onnx_last_error};
+    use tabular_onnx::ffi_table::{
+        tabular_onnx_predict_table, tabular_onnx_prediction_free, TabularOnnxColumn,
+        TabularOnnxPrediction, TabularOnnxTable, TABULAR_ONNX_COLUMN_NUMERIC,
+    };
+
+    let model = "models/tabular-cls-medium-f16.onnx";
+    assert!(
+        std::env::var_os("ORT_DYLIB_PATH").is_some(),
+        "set ORT_DYLIB_PATH before running this test"
+    );
+    assert!(
+        std::path::Path::new(model).exists(),
+        "missing model: {model}"
+    );
+
+    let model = CString::new(model).unwrap();
+    let mut handle = std::ptr::null_mut();
+    let status = unsafe { tabular_onnx_create(model.as_ptr(), &mut handle) };
+    if status != 0 {
+        let error = unsafe { CStr::from_ptr(tabular_onnx_last_error()) };
+        panic!("create failed: {}", error.to_string_lossy());
+    }
+
+    let context_rows = 16;
+    let rows = context_rows + 2;
+    let feature_count = 13;
+    let names = (0..feature_count)
+        .map(|index| CString::new(format!("f{index}")).unwrap())
+        .chain(std::iter::once(CString::new("target").unwrap()))
+        .collect::<Vec<_>>();
+    let mut values = (0..feature_count)
+        .map(|column| {
+            (0..rows)
+                .map(|row| ((row * feature_count + column) % 17) as f64 / 7.0)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    values.push(
+        (0..rows)
+            .map(|row| if row % 2 == 0 { 0.0 } else { 1.0 })
+            .collect(),
+    );
+    let columns = (0..names.len())
+        .map(|index| TabularOnnxColumn {
+            name: names[index].as_ptr(),
+            kind: TABULAR_ONNX_COLUMN_NUMERIC,
+            numeric_values: values[index].as_ptr(),
+            category_values: std::ptr::null(),
+        })
+        .collect::<Vec<_>>();
+    let table = TabularOnnxTable {
+        columns: columns.as_ptr(),
+        column_count: columns.len(),
+        row_count: rows,
+    };
+    let target = CString::new("target").unwrap();
+    let mut prediction = unsafe { std::mem::zeroed::<TabularOnnxPrediction>() };
+    let status = unsafe {
+        tabular_onnx_predict_table(
+            handle,
+            0,
+            &table,
+            context_rows,
+            target.as_ptr(),
+            &mut prediction,
+        )
+    };
+    if status != 0 {
+        let error = unsafe { CStr::from_ptr(tabular_onnx_last_error()) };
+        panic!("predict_table failed: {}", error.to_string_lossy());
+    }
+
+    assert_eq!(prediction.rows, 2);
+    assert_eq!(prediction.columns, 2);
+    assert_eq!(prediction.class_count, 2);
+    assert!(!prediction.values.is_null());
+    for row in 0..prediction.rows {
+        let p0 = unsafe { *prediction.values.add(row * prediction.columns) };
+        let p1 = unsafe { *prediction.values.add(row * prediction.columns + 1) };
+        assert!((p0 + p1 - 1.0).abs() < 1e-4, "probabilities {p0} + {p1}");
+    }
+
+    unsafe {
+        tabular_onnx_prediction_free(&mut prediction);
+        tabular_onnx_destroy(handle);
+    }
+}
+
+#[test]
+#[ignore = "requires models/tabular-reg-medium-f16.onnx and ORT_DYLIB_PATH; run with --ignored"]
+fn high_level_table_api_regresses_without_tensors() {
+    use std::ffi::{CStr, CString};
+    use tabular_onnx::ffi::{tabular_onnx_create, tabular_onnx_destroy, tabular_onnx_last_error};
+    use tabular_onnx::ffi_table::{
+        tabular_onnx_predict_table, tabular_onnx_prediction_free, TabularOnnxColumn,
+        TabularOnnxPrediction, TabularOnnxTable, TABULAR_ONNX_COLUMN_NUMERIC,
+    };
+
+    let model = "models/tabular-reg-medium-f16.onnx";
+    assert!(
+        std::env::var_os("ORT_DYLIB_PATH").is_some(),
+        "set ORT_DYLIB_PATH before running this test"
+    );
+    assert!(
+        std::path::Path::new(model).exists(),
+        "missing model: {model}"
+    );
+
+    let model = CString::new(model).unwrap();
+    let mut handle = std::ptr::null_mut();
+    let status = unsafe { tabular_onnx_create(model.as_ptr(), &mut handle) };
+    if status != 0 {
+        let error = unsafe { CStr::from_ptr(tabular_onnx_last_error()) };
+        panic!("create failed: {}", error.to_string_lossy());
+    }
+
+    let context_rows = 16;
+    let rows = context_rows + 2;
+    let feature_count = 5;
+    let names = (0..feature_count)
+        .map(|index| CString::new(format!("f{index}")).unwrap())
+        .chain(std::iter::once(CString::new("target").unwrap()))
+        .collect::<Vec<_>>();
+    let mut values = (0..feature_count)
+        .map(|column| {
+            (0..rows)
+                .map(|row| ((row * feature_count + column) % 23) as f64 / 11.0)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    values.push((0..rows).map(|row| 100.0 + (row % 7) as f64).collect());
+    let columns = (0..names.len())
+        .map(|index| TabularOnnxColumn {
+            name: names[index].as_ptr(),
+            kind: TABULAR_ONNX_COLUMN_NUMERIC,
+            numeric_values: values[index].as_ptr(),
+            category_values: std::ptr::null(),
+        })
+        .collect::<Vec<_>>();
+    let table = TabularOnnxTable {
+        columns: columns.as_ptr(),
+        column_count: columns.len(),
+        row_count: rows,
+    };
+    let target = CString::new("target").unwrap();
+    let mut prediction = unsafe { std::mem::zeroed::<TabularOnnxPrediction>() };
+    let status = unsafe {
+        tabular_onnx_predict_table(
+            handle,
+            1,
+            &table,
+            context_rows,
+            target.as_ptr(),
+            &mut prediction,
+        )
+    };
+    if status != 0 {
+        let error = unsafe { CStr::from_ptr(tabular_onnx_last_error()) };
+        panic!("predict_table failed: {}", error.to_string_lossy());
+    }
+
+    assert_eq!(prediction.rows, 2);
+    assert_eq!(prediction.columns, 3);
+    assert_eq!(prediction.quantile_count, 999);
+    assert!(!prediction.values.is_null());
+    assert!(!prediction.quantiles.is_null());
+    for index in 0..prediction.rows * prediction.columns {
+        assert!(unsafe { *prediction.values.add(index) }.is_finite());
+    }
+
+    unsafe {
+        tabular_onnx_prediction_free(&mut prediction);
+        tabular_onnx_destroy(handle);
+    }
+}
+
+#[test]
+#[ignore = "requires models/tabular-reg-medium-f16.onnx and ORT_DYLIB_PATH; run with --ignored"]
+fn high_level_forecast_handles_univariate_history() {
+    use std::ffi::{CStr, CString};
+    use tabular_onnx::ffi::{tabular_onnx_create, tabular_onnx_destroy, tabular_onnx_last_error};
+    use tabular_onnx::ffi_table::{
+        tabular_onnx_forecast, tabular_onnx_prediction_free, TabularOnnxColumn,
+        TabularOnnxPrediction, TabularOnnxTable, TABULAR_ONNX_COLUMN_NUMERIC,
+    };
+
+    let model = "models/tabular-reg-medium-f16.onnx";
+    assert!(
+        std::env::var_os("ORT_DYLIB_PATH").is_some(),
+        "set ORT_DYLIB_PATH before running this test"
+    );
+    assert!(
+        std::path::Path::new(model).exists(),
+        "missing model: {model}"
+    );
+
+    let model = CString::new(model).unwrap();
+    let mut handle = std::ptr::null_mut();
+    let status = unsafe { tabular_onnx_create(model.as_ptr(), &mut handle) };
+    if status != 0 {
+        let error = unsafe { CStr::from_ptr(tabular_onnx_last_error()) };
+        panic!("create failed: {}", error.to_string_lossy());
+    }
+
+    let rows = 20;
+    let values = (0..rows)
+        .map(|row| 100.0 + row as f64 * 0.5)
+        .collect::<Vec<_>>();
+    let target_name = CString::new("target").unwrap();
+    let column = TabularOnnxColumn {
+        name: target_name.as_ptr(),
+        kind: TABULAR_ONNX_COLUMN_NUMERIC,
+        numeric_values: values.as_ptr(),
+        category_values: std::ptr::null(),
+    };
+    let table = TabularOnnxTable {
+        columns: &column,
+        column_count: 1,
+        row_count: rows,
+    };
+    let mut prediction = unsafe { std::mem::zeroed::<TabularOnnxPrediction>() };
+    let status = unsafe {
+        tabular_onnx_forecast(
+            handle,
+            1,
+            &table,
+            16,
+            target_name.as_ptr(),
+            3,
+            std::ptr::null(),
+            &mut prediction,
+        )
+    };
+    if status != 0 {
+        let error = unsafe { CStr::from_ptr(tabular_onnx_last_error()) };
+        panic!("forecast failed: {}", error.to_string_lossy());
+    }
+
+    assert_eq!(prediction.rows, 3);
+    assert_eq!(prediction.columns, 3);
+    assert_eq!(prediction.quantile_count, 999);
+    for index in 0..prediction.rows * prediction.columns {
+        assert!(unsafe { *prediction.values.add(index) }.is_finite());
+    }
+    for index in 0..prediction.rows * prediction.quantile_count {
+        assert!(unsafe { *prediction.quantiles.add(index) }.is_finite());
+    }
+
+    unsafe {
+        tabular_onnx_prediction_free(&mut prediction);
+        tabular_onnx_destroy(handle);
+    }
+}
