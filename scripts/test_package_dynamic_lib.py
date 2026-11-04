@@ -20,9 +20,9 @@ class PackageDynamicLibTests(unittest.TestCase):
 
         self.assertEqual(package.name, "libonnx-linux-x86_64")
         self.assertEqual((package / "include/onnx_ffi.h").read_text(), "/* public api */\n")
-        self.assertEqual((package / "lib/libkumo-onnx-x86_64.so").read_bytes(), b"library")
+        self.assertEqual((package / "lib/libaqonnx-x86_64.so").read_bytes(), b"library")
         self.assertTrue((package / "BUILD_INFO.txt").is_file())
-        self.assertIn("Library: lib/libkumo-onnx-x86_64.so", (package / "BUILD_INFO.txt").read_text())
+        self.assertIn("Library: lib/libaqonnx-x86_64.so", (package / "BUILD_INFO.txt").read_text())
         deps = (package / "RUNTIME_DEPS.txt").read_text()
         self.assertIn("loaded dynamically", deps)
         self.assertIn("not linked", deps)
@@ -30,9 +30,9 @@ class PackageDynamicLibTests(unittest.TestCase):
 
     def test_names_library_after_arch_with_platform_extension(self):
         cases = (
-            ("linux", "x86_64", "libkumo-onnx-x86_64.so"),
-            ("macos", "aarch64", "libkumo-onnx-aarch64.dylib"),
-            ("windows", "x86_64", "libkumo-onnx-x86_64.dll"),
+            ("linux", "x86_64", "libaqonnx-x86_64.so"),
+            ("macos", "aarch64", "libaqonnx-aarch64.dylib"),
+            ("windows", "x86_64", "libaqonnx-x86_64.dll"),
         )
         for platform, arch, library_name in cases:
             with self.subTest(platform=platform):

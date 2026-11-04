@@ -8,8 +8,8 @@ import shutil
 from pathlib import Path
 
 EXTENSIONS = {"linux": ".so", "windows": ".dll", "macos": ".dylib"}
-# Name of the packaged library, e.g. libkumo-onnx-x86_64.so.
-LIBRARY_STEM = "libkumo-onnx"
+# Name of the packaged library, e.g. libaqonnx-x86_64.so.
+LIBRARY_STEM = "libaqonnx"
 ONNXRUNTIME_NAMES = {
     "linux": "libonnxruntime.so",
     "windows": "onnxruntime.dll",

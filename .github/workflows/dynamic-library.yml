@@ -140,7 +140,7 @@ jobs:
           test -f "$package/include/onnx_ffi.h"
           test -f "$package/ONNXRUNTIME_LICENSE"
           shopt -s nullglob
-          libraries=("$package/lib"/libkumo-onnx-*)
+          libraries=("$package/lib"/libaqonnx-*)
           runtimes=("$package/lib"/*onnxruntime*)
           test "${#libraries[@]}" -eq 1
           test "${#runtimes[@]}" -eq 1

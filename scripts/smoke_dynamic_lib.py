@@ -20,7 +20,7 @@ def find_packaged_library(package: Path) -> Path:
     candidates = [
         entry
         for entry in sorted(lib_dir.iterdir())
-        if entry.is_file() and entry.name.startswith("libkumo-onnx-")
+        if entry.is_file() and entry.name.startswith("libaqonnx-")
     ]
     if len(candidates) != 1:
         raise FileNotFoundError(
