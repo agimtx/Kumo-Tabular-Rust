@@ -3,6 +3,11 @@ name: Build dynamic libraries
 on:
   workflow_dispatch:
 
+env:
+  # Pinned runtime bundled into every bundle. ONNX Runtime keeps older C API
+  # versions, so 1.23.0 remains compatible with the `ort` crate's API level.
+  ORT_VERSION: "1.23.0"
+
 permissions:
   contents: read
 
@@ -29,15 +34,27 @@ jobs:
             rust-target: aarch64-apple-darwin
             library: libtabular_onnx.dylib
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust-target }}
       - name: Build dynamic library
         run: cargo build --release --lib --target ${{ matrix.rust-target }}
-      - name: Package library and header
+      - name: Fetch ONNX Runtime
+        shell: bash
+        run: |
+          ROOT=$(python scripts/fetch_onnxruntime.py \
+            --version "$ORT_VERSION" \
+            --platform "${{ matrix.platform }}" \
+            --arch "${{ matrix.arch }}" \
+            --output "$RUNNER_TEMP/onnxruntime")
+          echo "ORT_ROOT=$ROOT" >> "$GITHUB_ENV"
+      - name: Package library, header, and ONNX Runtime
         shell: bash
         run: >-
           python scripts/package_dynamic_lib.py
@@ -46,6 +63,26 @@ jobs:
           --output runtime-lib
           --platform ${{ matrix.platform }}
           --arch ${{ matrix.arch }}
+          --onnxruntime-dir "$ORT_ROOT/lib"
+          --onnxruntime-version "$ORT_VERSION"
+          --onnxruntime-license "$ORT_ROOT/LICENSE"
+      - name: Verify bundle contents
+        shell: bash
+        run: |
+          package="runtime-lib/libonnx-${{ matrix.platform }}-${{ matrix.arch }}"
+          ls -l "$package" "$package/lib"
+          test -f "$package/include/onnx_ffi.h"
+          test -f "$package/ONNXRUNTIME_LICENSE"
+          shopt -s nullglob
+          libraries=("$package/lib"/libonnx-*)
+          runtimes=("$package/lib"/*onnxruntime*)
+          test "${#libraries[@]}" -gt 0
+          test "${#runtimes[@]}" -gt 0
+      - name: Smoke test bundled ONNX Runtime
+        shell: bash
+        run: >-
+          python scripts/smoke_dynamic_lib.py
+          --package "runtime-lib/libonnx-${{ matrix.platform }}-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
         with:
           name: libonnx-${{ matrix.platform }}-${{ matrix.arch }}

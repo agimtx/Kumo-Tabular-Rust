@@ -26,10 +26,29 @@ fn set_error(message: impl ToString) {
 }
 
 fn ffi_result<T>(operation: impl FnOnce() -> crate::Result<T>) -> Result<T, i32> {
-    operation().map_err(|error| {
-        set_error(error);
-        TABULAR_ONNX_ERROR
-    })
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => {
+            set_error(error);
+            Err(TABULAR_ONNX_ERROR)
+        }
+        Err(payload) => {
+            set_error(panic_message(payload));
+            Err(TABULAR_ONNX_ERROR)
+        }
+    }
+}
+
+/// Turn a caught panic payload into an error message instead of letting it
+/// unwind across the C ABI, which aborts the host process.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .map(str::to_owned)
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_owned());
+    format!("internal panic: {detail}")
 }
 
 /// Return a thread-local error string, valid until the next API call on this thread.
@@ -39,7 +58,8 @@ pub extern "C" fn tabular_onnx_last_error() -> *const c_char {
 }
 
 /// Load an ONNX model. `model_path` must be a UTF-8, NUL-terminated path.
-/// The application must make the ONNX Runtime shared library discoverable first.
+/// ONNX Runtime is loaded from the `lib/` directory shipped next to this
+/// library, unless `ORT_DYLIB_PATH` points at another installation.
 #[no_mangle]
 pub unsafe extern "C" fn tabular_onnx_create(
     model_path: *const c_char,
@@ -156,7 +176,8 @@ pub unsafe extern "C" fn tabular_onnx_free_values(values: *mut f32, rows: usize,
 #[no_mangle]
 pub unsafe extern "C" fn tabular_onnx_destroy(handle: *mut TabularOnnxHandle) {
     if !handle.is_null() {
-        drop(Box::from_raw(handle));
+        let _ =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(Box::from_raw(handle))));
     }
 }
 

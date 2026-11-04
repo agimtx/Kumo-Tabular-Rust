@@ -18,9 +18,10 @@ enum {
 };
 
 /*
- * Load an ONNX file. model_path must be UTF-8. The caller must make a
- * compatible ONNX Runtime shared library available to the platform loader
- * before calling this function. On failure, out_handle remains NULL.
+ * Load an ONNX file. model_path must be UTF-8. ONNX Runtime is loaded from the
+ * lib/ directory shipped with this library unless ORT_DYLIB_PATH selects
+ * another installation. On failure, out_handle remains NULL and
+ * tabular_onnx_last_error() explains why.
  */
 int32_t tabular_onnx_create(const char *model_path, TabularOnnxHandle **out_handle);
 

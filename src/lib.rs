@@ -11,6 +11,7 @@ pub mod kumo_recipe;
 pub mod model;
 pub mod onnx;
 pub mod preprocess;
+mod runtime;
 pub mod table;
 
 pub use error::{Error, Result};

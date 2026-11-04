@@ -14,6 +14,7 @@ pub struct OnnxSession {
 
 impl OnnxSession {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        crate::runtime::ensure_onnx_runtime()?;
         let session = Session::builder()
             .map_err(ort_error)?
             .commit_from_file(path)
