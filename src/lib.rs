@@ -1,10 +1,11 @@
 //! Extensible preprocessing and ONNX inference for tabular models.
 //!
 //! The crate separates input preparation from model-specific tensor contracts.
-//! A future FFI can expose [`Table`], [`Predictor`] and serializable configs
-//! without coupling callers to Polars or ONNX Runtime internals.
+//! A C ABI exposes dynamic Kumo ONNX inference without requiring callers to link
+//! Rust or Polars.
 
 pub mod error;
+pub mod ffi;
 pub mod kumo;
 pub mod kumo_recipe;
 pub mod model;

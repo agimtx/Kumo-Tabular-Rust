@@ -2,8 +2,8 @@
 
 Rust library for tabular preprocessing and ONNX Runtime inference. It provides a
 typed table model, a serializable preprocessor, named-tensor ONNX sessions, a
-model registry, and adapters for the Kumo Tabular exports in this repository.
-FFI is not included yet.
+model registry, adapters for the Kumo Tabular exports in this repository, and a
+C ABI for loading a dynamic ONNX model and running Kumo inference.
 
 ## Layout
 
@@ -19,6 +19,12 @@ FFI is not included yet.
 
 Model and checkpoint files are ignored by Git; place them in `models/` and `pt/`
 before running the model-backed tests.
+
+## C ABI
+
+The crate builds both an Rust library and a C-compatible dynamic library. The public API is in `include/onnx_ffi.h`; create a model handle, call `tabular_onnx_predict` with row-major `float32` features, context labels and a categorical mask, then release the returned values and handle with the matching API functions. Classification returns 10 raw logits and regression returns 999 quantiles. This is a tensor-level Kumo interface: callers remain responsible for preparing feature columns and encoded labels.
+
+GitHub Actions builds downloadable bundles for Linux x86_64, Windows x86_64, and macOS arm64. Each bundle contains `include/onnx_ffi.h`, `lib/libonnx-{platform}-{arch}` with the platform library extension, `BUILD_INFO.txt`, and `RUNTIME_DEPS.txt`. ONNX Runtime is loaded dynamically and must be provided by the host application; it is not included in these bundles.
 
 ## Rust API
 
