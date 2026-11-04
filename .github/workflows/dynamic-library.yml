@@ -2,6 +2,16 @@ name: Build dynamic libraries
 
 on:
   workflow_dispatch:
+    inputs:
+      arch:
+        description: Target architecture
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - x86_64
+          - aarch64
 
 env:
   # Pinned runtime bundled into every bundle. ONNX Runtime keeps older C API
@@ -12,27 +22,62 @@ permissions:
   contents: read
 
 jobs:
+  # Resolve the `arch` choice into concrete build targets. A workflow matrix
+  # cannot be filtered by an expression, so the selection happens here and the
+  # build job consumes the result through `fromJSON`.
+  prepare:
+    name: Select targets for ${{ inputs.arch }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Filter build targets by architecture
+        id: matrix
+        shell: bash
+        env:
+          ARCH: ${{ inputs.arch }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          targets = [
+              {
+                  "runner": "ubuntu-latest",
+                  "platform": "linux",
+                  "arch": "x86_64",
+                  "rust-target": "x86_64-unknown-linux-gnu",
+                  "library": "libtabular_onnx.so",
+              },
+              {
+                  "runner": "windows-latest",
+                  "platform": "windows",
+                  "arch": "x86_64",
+                  "rust-target": "x86_64-pc-windows-msvc",
+                  "library": "tabular_onnx.dll",
+              },
+              {
+                  "runner": "macos-latest",
+                  "platform": "macos",
+                  "arch": "aarch64",
+                  "rust-target": "aarch64-apple-darwin",
+                  "library": "libtabular_onnx.dylib",
+              },
+          ]
+
+          arch = os.environ["ARCH"]
+          selected = [target for target in targets if arch in ("all", target["arch"])]
+          if not selected:
+              raise SystemExit(f"no build targets for arch {arch}")
+          print("matrix=" + json.dumps({"include": selected}))
+          PY
+
   build:
     name: ${{ matrix.platform }}-${{ matrix.arch }}
+    needs: prepare
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            platform: linux
-            arch: x86_64
-            rust-target: x86_64-unknown-linux-gnu
-            library: libtabular_onnx.so
-          - runner: windows-latest
-            platform: windows
-            arch: x86_64
-            rust-target: x86_64-pc-windows-msvc
-            library: tabular_onnx.dll
-          - runner: macos-latest
-            platform: macos
-            arch: aarch64
-            rust-target: aarch64-apple-darwin
-            library: libtabular_onnx.dylib
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
