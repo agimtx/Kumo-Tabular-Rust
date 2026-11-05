@@ -5,8 +5,11 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
+import sdm
 from sdm.models.kumo.tabular.model import MODEL_KWARGS, _KumoTabular
+from sdm.processing.execution import RecipeExecution
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,6 +37,18 @@ def main() -> None:
     trace_path = ROOT / "output" / f"medium-{args.task}-context-{args.context_rows}-seed-{args.seed}-trace.json"
     trace = json.loads(trace_path.read_text())
     batches = trace[f"{args.split}_prepared"]
+    dataframe = pd.read_parquet(ROOT / trace["dataset"])
+    feature_stypes = {
+        name: (
+            "categorical"
+            if pd.api.types.is_string_dtype(dataframe[name])
+            or name in {"month", "region", "phone_operator"}
+            else "numerical"
+        )
+        for name in trace["features"]
+    }
+    feature_stypes[trace["target"]] = "categorical" if args.task == "classification" else "numerical"
+    table = sdm.TableTensor.from_pandas(dataframe, stypes=feature_stypes)
     model = load_core(args.task)
     torch.set_num_threads(4)
     rust_scores = []
@@ -41,9 +56,60 @@ def main() -> None:
     max_abs = 0.0
     mean_abs_sum = 0.0
     value_count = 0
+    recipe_value_max_abs = 0.0
+    recipe_mask_mismatches = 0
 
     with torch.inference_mode():
         for batch_index, batch in enumerate(batches):
+            batch_indices = trace[f"{args.split}_batches"][batch_index]
+            context = table[batch_indices["context"]]
+            query = table[batch_indices["query"]]
+            execution = RecipeExecution(sdm.models.KumoTabular.default_recipe())
+            members = execution.fit_transform(
+                x=context.drop_columns(trace["target"]),
+                y=context.select_columns([trace["target"]]),
+                related_tables=None,
+                num_members=1,
+                generator=torch.Generator().manual_seed(batch_index),
+            )
+            queries = execution.transform(
+                x=query.drop_columns(trace["target"]), related_tables=None
+            )
+            official_mask = [
+                members[0].input_stypes.get(name) == sdm.Stype.categorical
+                for name in members[0].x.columns[sdm.Stype.numerical]
+            ]
+            rust_mask = list(batch["categorical_mask"])
+            official_x = np.concatenate(
+                [members[0].x.numerical.numpy(), queries[0].x.numerical.numpy()],
+                axis=0,
+            )
+            # Feature order/sign are intentionally randomized independently.
+            # Match columns by absolute values before comparing semantic masks.
+            unused = set(range(official_x.shape[1]))
+            for rust_column, rust_values in enumerate(np.asarray(batch["x"]).T):
+                candidate = min(
+                    unused,
+                    key=lambda index: np.max(
+                        np.abs(np.abs(rust_values) - np.abs(official_x[:, index]))
+                    ),
+                )
+                unused.remove(candidate)
+                if rust_mask[rust_column] != official_mask[candidate]:
+                    recipe_mask_mismatches += 1
+            # The core parity below intentionally uses the exact Rust tensor.
+            if official_x.shape == np.asarray(batch["x"]).shape:
+                recipe_value_max_abs = max(
+                    recipe_value_max_abs,
+                    float(
+                        np.max(
+                            np.abs(
+                                np.sort(np.abs(official_x), axis=1)
+                                - np.sort(np.abs(np.asarray(batch["x"])), axis=1)
+                            )
+                        )
+                    ),
+                )
             x = torch.tensor(batch["x"], dtype=torch.float32)
             y = torch.tensor(
                 batch["y"],
@@ -89,6 +155,8 @@ def main() -> None:
         "prediction_mean_abs_error": float(prediction_delta.mean()),
         "prediction_max_abs_error": float(prediction_delta.max(initial=0)),
         "prediction_correlation": float(np.corrcoef(rust_scores, torch_scores)[0, 1]),
+        "recipe_semantic_mask_mismatch_batches": recipe_mask_mismatches,
+        "recipe_value_abs_max_after_row_sort": recipe_value_max_abs,
     }
     output = ROOT / "output" / f"medium-{args.task}-context-{args.context_rows}-prepared-core-parity.json"
     output.write_text(json.dumps(report, indent=2) + "\n")

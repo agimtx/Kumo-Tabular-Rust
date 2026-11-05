@@ -101,12 +101,12 @@ Dynamic exports accept:
 - `y`: `int64[context_rows]` for classification or `float32[context_rows]` for
   regression
 - `categorical_mask: bool[features]`
-- output `predictions: float32[query_rows, 10]` (class logits) or
+- output `predictions: float32[query_rows, 10]` (raw class logits, not probabilities) or
   `float32[query_rows, 999]` (regression quantiles)
 
 The Rust evaluator uses the public core contract directly with 16, 32 or 64
 context rows and up to 2 query rows per inference. Classification scores use the
-difference between the No and Yes raw logits after the fitted class
+difference between the No and Yes raw logits (apply `sigmoid(score)` for a two-class Yes probability) after the fitted class
 permutation; regression uses the median of the 999 quantiles. The fixed-shape
 `[6, 3]` `KumoBatch::from_features` adapter remains for legacy exports.
 

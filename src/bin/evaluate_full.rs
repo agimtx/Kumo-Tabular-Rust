@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::{error::Error, fs, path::Path, process::Command, time::Instant};
 use tabular_onnx::{
     kumo::KumoBatch,
-    kumo_recipe::{prepare, Task as RecipeTask},
+    kumo_recipe::{prepare_with_feature_types, FeatureType, Task as RecipeTask},
     OnnxSession, Task,
 };
 
@@ -14,6 +14,22 @@ type Dataset = (Vec<String>, Vec<Vec<Value>>, Vec<f64>);
 type BatchIndices = (Vec<usize>, Vec<usize>);
 const DEFAULT_CONTEXT: usize = 32;
 const QUERIES: usize = 2;
+
+fn feature_types(task: Task, names: &[String]) -> Option<Vec<FeatureType>> {
+    if task != Task::Classification {
+        return None;
+    }
+    Some(
+        names
+            .iter()
+            .map(|name| match name.as_str() {
+                // These are nominal integer-coded columns in the dataset.
+                "month" | "region" | "phone_operator" => FeatureType::Categorical,
+                _ => FeatureType::Numerical,
+            })
+            .collect(),
+    )
+}
 
 #[derive(Clone, Default)]
 struct Latency {
@@ -170,6 +186,7 @@ fn infer(
     seed: u64,
     context_rows: usize,
     trace_batches: Option<&mut Vec<Value>>,
+    feature_types: Option<&[FeatureType]>,
 ) -> EvalResult<(Vec<f64>, f64, Vec<BatchIndices>, Latency)> {
     let mut rng = StdRng::seed_from_u64(seed);
     let start = Instant::now();
@@ -206,7 +223,7 @@ fn infer(
         } else {
             RecipeTask::Regression
         };
-        let prepared = prepare(
+        let prepared = prepare_with_feature_types(
             features,
             names,
             &context,
@@ -214,6 +231,7 @@ fn infer(
             labels,
             recipe_task,
             &mut rng,
+            feature_types,
         )?;
         let batch = KumoBatch::from_dynamic_features(
             &prepared.x,
@@ -256,18 +274,13 @@ fn infer(
         }
         for row in output.rows() {
             if task == Task::Classification {
-                // Undo category shift before comparing the two original classes.
-                let no = prepared
-                    .class_permutation
-                    .iter()
-                    .position(|&v| v == 0.0)
-                    .ok_or("missing No class")?;
-                let yes = prepared
-                    .class_permutation
-                    .iter()
-                    .position(|&v| v == 1.0)
-                    .ok_or("missing Yes class")?;
-                predictions.push((row[yes] - row[no]) as f64);
+                // A one-class context is valid in the Python API. The absent
+                // class receives a neutral logit of zero for this batch.
+                let no = prepared.class_permutation.iter().position(|&v| v == 0.0);
+                let yes = prepared.class_permutation.iter().position(|&v| v == 1.0);
+                let no_score = no.map_or(0.0, |index| row[index] as f64);
+                let yes_score = yes.map_or(0.0, |index| row[index] as f64);
+                predictions.push(yes_score - no_score);
             } else {
                 let mut quantiles = row.iter().copied().collect::<Vec<_>>();
                 quantiles.sort_by(f32::total_cmp);
@@ -374,6 +387,7 @@ fn evaluate(
     eprintln!("[{task:?} {precision}] loading dataset {path}");
     let (names, features, labels) = load_dataset(path, target)?;
     let names_ref = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let explicit_types = feature_types(task, &names);
     let (fit, validation, test) = split(&labels, classification, seed);
     if fit.len() < context_rows
         || (classification
@@ -406,6 +420,7 @@ fn evaluate(
         seed,
         context_rows,
         trace.then_some(&mut validation_prepared),
+        explicit_types.as_deref(),
     )?;
     let mut test_prepared = Vec::new();
     eprintln!("[{task:?} {precision}] held-out rows {}", test.len());
@@ -420,6 +435,7 @@ fn evaluate(
         seed,
         context_rows,
         trace.then_some(&mut test_prepared),
+        explicit_types.as_deref(),
     )?;
     let truth = test.iter().map(|&i| labels[i]).collect::<Vec<_>>();
     let validation_truth = validation.iter().map(|&i| labels[i]).collect::<Vec<_>>();

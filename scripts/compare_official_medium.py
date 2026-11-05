@@ -44,9 +44,30 @@ def latency_summary(samples: list[float]) -> dict:
     }
 
 
+CATEGORICAL_INTEGER_FEATURES = {"month", "region", "phone_operator"}
+
+
+def feature_stypes(
+    dataframe: pd.DataFrame, features: list[str], target: str, task: str
+) -> dict[str, str]:
+    stypes = {
+        column: (
+            "categorical"
+            if pd.api.types.is_string_dtype(dataframe[column])
+            or column in CATEGORICAL_INTEGER_FEATURES
+            else "numerical"
+        )
+        for column in features
+    }
+    stypes[target] = "categorical" if task == "classification" else "numerical"
+    return stypes
+
+
 def batches_fingerprint(trace: dict) -> str:
     digest = hashlib.sha256()
-    for split in ("validation", "test"):
+    digest.update(b"recipe-v2-explicit-integer-categories\0")
+    digest.update(json.dumps(trace["features"], separators=(",", ":")).encode())
+    for split in ("validation", "test"): 
         for batch in trace[f"{split}_batches"]:
             digest.update(np.asarray(batch["context"], dtype=np.int64).tobytes())
             digest.update(np.asarray(batch["query"], dtype=np.int64).tobytes())
@@ -141,9 +162,9 @@ def main() -> None:
         elapsed = cached["evaluation_seconds"]
         official_latency = cached.get("latency", {})
     else:
-        stypes = {column: ("categorical" if pd.api.types.is_string_dtype(dataframe[column])
-                             else "numerical") for column in trace["features"]}
-        stypes[trace["target"]] = "categorical" if args.task == "classification" else "numerical"
+        stypes = feature_stypes(
+            dataframe, trace["features"], trace["target"], args.task
+        )
         table = sdm.TableTensor.from_pandas(dataframe, stypes=stypes, device=args.device)
         note(f"loading official checkpoint and replaying batches for {args.task}")
         model = load_model(args.task, args.device)

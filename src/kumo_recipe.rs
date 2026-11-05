@@ -10,6 +10,7 @@ const EPS: f64 = 1e-6;
 const CLIP: f64 = 100.0;
 const CLIP_SIGMA: f64 = 4.0;
 const CARDINALITY_THRESHOLD: usize = 50;
+const MAX_FEATURES: usize = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Task {
@@ -40,7 +41,8 @@ fn numeric_stats(values: &[f64], rng: &mut StdRng, flip: bool) -> NumericStats {
         .map(|v| ((v - feature_mean) / scale).clamp(-CLIP, CLIP))
         .collect::<Vec<_>>();
     let center = mean(&normalized);
-    let std = sample_std(&normalized, center).max(EPS);
+    // Official ClipSigma uses population variance for its first pass.
+    let std = population_std(&normalized, center).max(EPS);
     let kept = normalized
         .iter()
         .copied()
@@ -65,6 +67,8 @@ fn transform_numeric(raw: f64, stats: NumericStats) -> f32 {
     if raw.is_nan() {
         return f32::NAN;
     }
+    // Match Standardize -> Clip(-100, 100): infinities are clipped, while
+    // missing NaNs remain missing.
     let z = ((raw - stats.mean) / stats.scale).clamp(-CLIP, CLIP);
     let log_abs = z.abs().ln_1p();
     z.max(stats.lower - log_abs)
@@ -76,6 +80,10 @@ fn sample_std(values: &[f64], center: f64) -> f64 {
     (values.iter().map(|v| (v - center).powi(2)).sum::<f64>()
         / values.len().saturating_sub(1).max(1) as f64)
         .sqrt()
+}
+
+fn population_std(values: &[f64], center: f64) -> f64 {
+    (values.iter().map(|v| (v - center).powi(2)).sum::<f64>() / values.len().max(1) as f64).sqrt()
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prepared {
@@ -121,6 +129,31 @@ pub fn prepare(
     task: Task,
     rng: &mut StdRng,
 ) -> Result<Prepared, String> {
+    prepare_with_feature_types(
+        rows,
+        feature_names,
+        context_indices,
+        query_indices,
+        target_values,
+        task,
+        rng,
+        None,
+    )
+}
+
+/// Prepare using explicit semantic types. `None` preserves the legacy
+/// inference rule (string columns are categorical); otherwise the slice must
+/// contain one type per feature column.
+pub fn prepare_with_feature_types(
+    rows: &[Vec<Value>],
+    feature_names: &[&str],
+    context_indices: &[usize],
+    query_indices: &[usize],
+    target_values: &[f64],
+    task: Task,
+    rng: &mut StdRng,
+    feature_types: Option<&[FeatureType]>,
+) -> Result<Prepared, String> {
     prepare_impl(
         rows,
         feature_names,
@@ -130,6 +163,7 @@ pub fn prepare(
         task,
         rng,
         Some(10),
+        feature_types,
     )
 }
 
@@ -157,6 +191,7 @@ pub fn prepare_any_classes(
         task,
         rng,
         None,
+        None,
     )
 }
 
@@ -170,6 +205,7 @@ fn prepare_impl(
     task: Task,
     rng: &mut StdRng,
     max_classes: Option<usize>,
+    feature_types: Option<&[FeatureType]>,
 ) -> Result<Prepared, String> {
     if target_values.len() != rows.len() {
         return Err("target values must align with rows".into());
@@ -182,15 +218,22 @@ fn prepare_impl(
     if context_indices.is_empty() || query_indices.is_empty() {
         return Err("at least one context and one query row are required".into());
     }
-    let kinds: Vec<_> = (0..feature_names.len())
-        .map(|c| {
-            if rows.iter().any(|row| matches!(row[c], Value::String(_))) {
-                FeatureType::Categorical
-            } else {
-                FeatureType::Numerical
-            }
-        })
-        .collect();
+    let kinds = if let Some(feature_types) = feature_types {
+        if feature_types.len() != feature_names.len() {
+            return Err("feature types must match feature width".into());
+        }
+        feature_types.to_vec()
+    } else {
+        (0..feature_names.len())
+            .map(|c| {
+                if rows.iter().any(|row| matches!(row[c], Value::String(_))) {
+                    FeatureType::Categorical
+                } else {
+                    FeatureType::Numerical
+                }
+            })
+            .collect()
+    };
     let mut keep = Vec::new();
     let mut categories = Vec::with_capacity(feature_names.len());
     let mut numeric: Vec<Option<NumericStats>> = vec![None; feature_names.len()];
@@ -213,16 +256,27 @@ fn prepare_impl(
                 }
             }
             FeatureType::Categorical => {
-                let vals: BTreeSet<String> = context_indices
+                let mut vals = context_indices
                     .iter()
                     .filter_map(|&i| category(&rows[i][c]))
-                    .collect();
-                // AlignCategories: zero-based sorted context vocabulary, with -1 for unknown/missing.
-                let codes: BTreeMap<String, usize> = vals
+                    .collect::<Vec<_>>();
+                vals.sort();
+                vals.dedup();
+                // AlignCategories(sort_by="value") sorts numeric categories by
+                // numeric value, not by their string rendering (1, 2, 10).
+                if context_indices
                     .iter()
-                    .enumerate()
-                    .map(|(i, s)| (s.clone(), i))
-                    .collect();
+                    .all(|&i| number(&rows[i][c]).is_some())
+                {
+                    vals.sort_by(|a, b| {
+                        a.parse::<f64>()
+                            .unwrap_or(f64::NAN)
+                            .total_cmp(&b.parse::<f64>().unwrap_or(f64::NAN))
+                    });
+                }
+                // AlignCategories: zero-based sorted context vocabulary, with -1 for unknown/missing.
+                let codes: BTreeMap<String, usize> =
+                    vals.into_iter().enumerate().map(|(i, s)| (s, i)).collect();
                 let mut counts = BTreeMap::new();
                 let mut negative_count = 0;
                 for &i in context_indices {
@@ -365,6 +419,7 @@ fn prepare_impl(
             .map(|&r| permutation[(permutation.len() - r) % permutation.len()])
             .collect();
     }
+    permutation.truncate(MAX_FEATURES);
     let mut mask: Vec<bool> = keep
         .iter()
         .map(|&c| kinds[c] == FeatureType::Categorical)
@@ -377,6 +432,7 @@ fn prepare_impl(
     let mask = permutation
         .iter()
         .map(|&source| mask[source])
+        .take(MAX_FEATURES)
         .collect::<Vec<_>>();
     let row_indices: Vec<usize> = context_indices
         .iter()
@@ -424,8 +480,9 @@ fn prepare_impl(
             }
         })
         .collect();
-    // Mask follows numerical, count, categorical and Latin-permuted columns.
-    let mask = permutation.iter().map(|&i| mask[i]).collect();
+    // `mask` is already in final column order: `initial_sources` moved it to
+    // numerical/count/categorical order, then `permutation` applied the Latin
+    // shuffle once. Do not apply `permutation` again here.
     // Keep named feature order observable through an optional debug invariant.
     debug_assert!(keep.iter().all(|&i| i < feature_names.len()));
     Ok(Prepared {
@@ -449,7 +506,9 @@ fn validate_indices(indices: &[usize], n: usize) -> Result<(), String> {
 }
 fn number(v: &Value) -> Option<f64> {
     match v {
-        Value::Number(n) => n.as_f64().filter(|x| x.is_finite()),
+        // Keep infinities as numeric inputs. Fitting ignores them, while the
+        // transform's [-100, 100] clamp matches the official recipe.
+        Value::Number(n) => n.as_f64(),
         Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
         _ => None,
     }
@@ -644,6 +703,74 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.labels.len(), 11);
         assert_eq!(prepared.class_permutation.len(), 11);
+    }
+
+    #[test]
+    fn categorical_mask_follows_shuffled_columns() {
+        let rows = (0..10)
+            .map(|i| {
+                vec![
+                    n(i as i64),
+                    s(if i % 2 == 0 { "a" } else { "b" }),
+                    s(&format!("g{}", i % 3)),
+                    n((i * 7) as i64),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let labels = (0..10).map(|i| (i % 2) as f64).collect::<Vec<_>>();
+        let context = (0..8).collect::<Vec<_>>();
+        let query = [8, 9];
+        for seed in 0..64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let prepared = prepare(
+                &rows,
+                &["num", "cat_a", "cat_b", "num_b"],
+                &context,
+                &query,
+                &labels,
+                Task::Regression,
+                &mut rng,
+            )
+            .unwrap();
+            for column in 0..prepared.x.ncols() {
+                let mut distinct = prepared.x.column(column).to_vec();
+                distinct.sort_by(f32::total_cmp);
+                distinct.dedup();
+                // Categorical columns have at most three observed codes;
+                // numerical columns have one distinct value per row.
+                assert_eq!(
+                    prepared.categorical_mask[column],
+                    distinct.len() <= 3,
+                    "seed {seed}, shuffled column {column}, distinct {distinct:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_numeric_categories_use_numeric_value_order() {
+        let rows = vec![
+            vec![n(1), n(10)],
+            vec![n(10), n(1)],
+            vec![n(2), n(2)],
+            vec![n(12), n(12)],
+        ];
+        let labels = vec![0.0, 1.0, 0.0, 1.0];
+        let kinds = [FeatureType::Categorical, FeatureType::Numerical];
+        let mut rng = StdRng::seed_from_u64(7);
+        let prepared = prepare_with_feature_types(
+            &rows,
+            &["month", "value"],
+            &[0, 1, 2],
+            &[3],
+            &labels,
+            Task::Classification,
+            &mut rng,
+            Some(&kinds),
+        )
+        .unwrap();
+        assert_eq!(prepared.categorical_mask.iter().filter(|&&v| v).count(), 1);
+        assert!(prepared.x.ncols() >= 1);
     }
 
     #[test]
