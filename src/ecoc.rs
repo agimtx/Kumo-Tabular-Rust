@@ -85,6 +85,11 @@ impl Codebook {
 
 /// Stable log-softmax for one row of core logits.
 pub fn log_softmax(logits: &[f32]) -> Vec<f32> {
+    assert!(!logits.is_empty(), "logits must not be empty");
+    assert!(
+        logits.iter().all(|value| value.is_finite()),
+        "logits must be finite"
+    );
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let normalizer = logits
         .iter()
@@ -103,6 +108,14 @@ pub fn log_softmax(logits: &[f32]) -> Vec<f32> {
 /// accumulates the log-probability of its active symbol in every task where it
 /// is not the rest bucket; the mean log-probability is then softmaxed.
 pub fn aggregate(codebook: &Codebook, logits_by_task: &[Vec<f32>], rows: usize) -> Vec<f32> {
+    assert_eq!(
+        logits_by_task.len(),
+        codebook.task_count(),
+        "ECOC task count mismatch"
+    );
+    assert!(logits_by_task
+        .iter()
+        .all(|logits| logits.len() == rows * CORE_CLASSES));
     let classes = codebook.num_classes();
     let mut sums = vec![0.0f64; rows * classes];
     let mut counts = vec![0usize; rows * classes];
@@ -209,6 +222,13 @@ mod tests {
         let total = probabilities.iter().sum::<f32>();
         assert!((total - 1.0).abs() < 1e-5, "probabilities sum to {total}");
         assert!(probabilities.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    #[should_panic(expected = "ECOC task count mismatch")]
+    fn aggregation_rejects_mismatched_task_count() {
+        let codebook = Codebook::build(11, 0);
+        aggregate(&codebook, &[], 1);
     }
 
     #[test]

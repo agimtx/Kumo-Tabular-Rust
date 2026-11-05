@@ -8,7 +8,7 @@
 use crate::ecoc::{aggregate, Codebook, CORE_CLASSES};
 use crate::ffi::{ffi_result, set_error, TabularOnnxHandle, TABULAR_ONNX_ERROR, TABULAR_ONNX_OK};
 use crate::kumo::KumoBatch;
-use crate::kumo_recipe::{prepare, prepare_any_classes, Prepared, Task as RecipeTask};
+use crate::kumo_recipe::{prepare_with_feature_types, FeatureType, Prepared, Task as RecipeTask};
 use crate::{Error, OnnxSession, Result, Task};
 use ndarray::Array2;
 use rand::rngs::StdRng;
@@ -74,7 +74,12 @@ struct ClassMap {
 }
 
 impl ClassMap {
-    fn from_context(rows: &[Vec<Value>], target_index: usize, context_rows: usize) -> Result<Self> {
+    fn from_context(
+        rows: &[Vec<Value>],
+        target_index: usize,
+        context_rows: usize,
+        numeric: bool,
+    ) -> Result<Self> {
         let mut labels = BTreeSet::new();
         for row in rows.iter().take(context_rows) {
             labels.insert(label_key(&row[target_index])?);
@@ -85,17 +90,13 @@ impl ClassMap {
             ));
         }
         let mut labels = labels.into_iter().collect::<Vec<_>>();
-        // A numeric target reads best in numeric order (0, 1, ..., 10) rather
-        // than lexicographic order (0, 1, 10, 2, ...). Categorical labels keep
-        // a stable lexicographic order.
-        labels.sort_by(
-            |left, right| match (left.parse::<f64>(), right.parse::<f64>()) {
-                (Ok(left), Ok(right)) if left.is_finite() && right.is_finite() => {
-                    left.total_cmp(&right)
-                }
-                _ => left.cmp(right),
-            },
-        );
+        if numeric {
+            labels.sort_by(|left, right| {
+                left.parse::<f64>()
+                    .unwrap_or(f64::NAN)
+                    .total_cmp(&right.parse::<f64>().unwrap_or(f64::NAN))
+            });
+        }
         let codes = labels
             .iter()
             .enumerate()
@@ -120,6 +121,7 @@ impl ClassMap {
 
 struct Request {
     feature_names: Vec<String>,
+    feature_types: Vec<FeatureType>,
     feature_rows: Vec<Vec<Value>>,
     target_values: Vec<f64>,
     class_map: Option<ClassMap>,
@@ -246,9 +248,14 @@ unsafe fn parse_columns(table: &TabularOnnxTable) -> Result<Vec<ParsedColumn>> {
                                 ))
                             })
                         } else {
-                            Err(Error::InvalidTable(format!(
-                                "numeric column {name} contains a non-finite value"
-                            )))
+                            Ok(Value::Object(serde_json::Map::from_iter([(
+                                "__tabular_onnx_ffi_infinity__".into(),
+                                Value::String(if value.is_sign_positive() {
+                                    "positive".into()
+                                } else {
+                                    "negative".into()
+                                }),
+                            )])))
                         }
                     })
                     .collect::<Result<Vec<_>>>()?
@@ -337,7 +344,7 @@ fn build_request(
     let feature_indices = (0..table.columns.len())
         .filter(|index| *index != table.target_index)
         .collect::<Vec<_>>();
-    let (feature_names, feature_rows) = if feature_indices.is_empty() {
+    let (feature_names, feature_types, feature_rows) = if feature_indices.is_empty() {
         // A target-only table is still a valid univariate series. Give the model
         // a deterministic time index instead of rejecting the call.
         let rows = rows
@@ -345,8 +352,22 @@ fn build_request(
             .enumerate()
             .map(|(index, _)| vec![Value::Number(Number::from(index as u64))])
             .collect::<Vec<_>>();
-        (vec!["__row_index".to_owned()], rows)
+        (
+            vec!["__row_index".to_owned()],
+            vec![FeatureType::Numerical],
+            rows,
+        )
     } else {
+        let feature_types = feature_indices
+            .iter()
+            .map(|&index| {
+                if table.columns[index].kind == TABULAR_ONNX_COLUMN_CATEGORICAL {
+                    FeatureType::Categorical
+                } else {
+                    FeatureType::Numerical
+                }
+            })
+            .collect::<Vec<_>>();
         let rows = rows
             .iter()
             .map(|row| {
@@ -356,14 +377,16 @@ fn build_request(
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        (table.feature_names.clone(), rows)
+        (table.feature_names.clone(), feature_types, rows)
     };
 
+    let target_is_numeric = table.columns[table.target_index].kind == TABULAR_ONNX_COLUMN_NUMERIC;
     let class_map = match task {
         Task::Classification => Some(ClassMap::from_context(
             &rows,
             table.target_index,
             context_rows,
+            target_is_numeric,
         )?),
         Task::Regression => None,
     };
@@ -391,6 +414,7 @@ fn build_request(
 
     Ok(Request {
         feature_names,
+        feature_types,
         feature_rows,
         target_values,
         class_map,
@@ -409,17 +433,24 @@ fn run_batch(
     session.run_kumo(batch)
 }
 
-fn softmax_row(row: &[f32]) -> Vec<f32> {
+fn softmax_row(row: &[f32]) -> Result<Vec<f32>> {
+    if row.is_empty() || row.iter().any(|value| !value.is_finite()) {
+        return Err(Error::Model(
+            "classification logits must be finite and non-empty".into(),
+        ));
+    }
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let values = row
         .iter()
         .map(|value| (value - max).exp())
         .collect::<Vec<_>>();
     let total = values.iter().sum::<f32>();
-    values
-        .into_iter()
-        .map(|value| if total > 0.0 { value / total } else { 0.0 })
-        .collect()
+    if !total.is_finite() || total <= 0.0 {
+        return Err(Error::Model(
+            "classification logits cannot be normalized".into(),
+        ));
+    }
+    Ok(values.into_iter().map(|value| value / total).collect())
 }
 
 fn classification_prediction(
@@ -440,10 +471,24 @@ fn classification_prediction(
             output.shape()
         )));
     }
-    if prepared.class_permutation.len() < classes {
+    if prepared.class_permutation.len() != classes {
         return Err(Error::Model(
-            "classification class permutation is shorter than the class count".into(),
+            "classification class permutation does not match the class count".into(),
         ));
+    }
+    let mut permutation = vec![false; classes];
+    for &value in &prepared.class_permutation {
+        if !value.is_finite() || value.fract() != 0.0 || value < 0.0 || value >= classes as f64 {
+            return Err(Error::Model(
+                "classification class permutation is invalid".into(),
+            ));
+        }
+        let index = value as usize;
+        if std::mem::replace(&mut permutation[index], true) {
+            return Err(Error::Model(
+                "classification class permutation is not bijective".into(),
+            ));
+        }
     }
     if output.iter().any(|value| !value.is_finite()) {
         return Err(Error::Model(
@@ -452,7 +497,7 @@ fn classification_prediction(
     }
     let mut values = vec![0.0f32; query_rows * classes];
     for row in 0..query_rows {
-        let probabilities = softmax_row(&output.row(row).to_vec()[..classes]);
+        let probabilities = softmax_row(&output.row(row).to_vec())?;
         for (encoded, probability) in probabilities.iter().enumerate() {
             let original = prepared.class_permutation[encoded] as usize;
             if original >= classes {
@@ -600,7 +645,7 @@ fn predict_rows(
             .as_ref()
             .is_some_and(|map| map.len() > CORE_CLASSES);
     let prepared = if wide_classification {
-        prepare_any_classes(
+        prepare_with_feature_types(
             &request.feature_rows,
             &feature_names,
             &context_indices,
@@ -608,9 +653,10 @@ fn predict_rows(
             &request.target_values,
             recipe_task,
             &mut rng,
+            Some(&request.feature_types),
         )
     } else {
-        prepare(
+        prepare_with_feature_types(
             &request.feature_rows,
             &feature_names,
             &context_indices,
@@ -618,16 +664,25 @@ fn predict_rows(
             &request.target_values,
             recipe_task,
             &mut rng,
+            Some(&request.feature_types),
         )
     }
     .map_err(Error::Preprocessing)?;
 
     match task {
         Task::Classification => {
-            let context_codes = request.target_values[..context_rows]
+            let context_codes = prepared
+                .labels
                 .iter()
-                .map(|value| *value as usize)
-                .collect::<Vec<_>>();
+                .map(|value| {
+                    if !value.is_finite() || *value < 0.0 || value.fract() != 0.0 {
+                        return Err(Error::Model(
+                            "prepared context class code is invalid".into(),
+                        ));
+                    }
+                    Ok(*value as usize)
+                })
+                .collect::<Result<Vec<_>>>()?;
             classification_prediction(
                 handle.session_mut(),
                 &prepared,
@@ -1115,7 +1170,7 @@ mod tests {
             vec![Value::Number(Number::from_f64(0.0).unwrap())],
             vec![Value::Number(Number::from_f64(1.0).unwrap())],
         ];
-        let map = ClassMap::from_context(&rows, 0, 3).unwrap();
+        let map = ClassMap::from_context(&rows, 0, 3, true).unwrap();
         assert_eq!(map.labels, vec!["0", "1"]);
         assert_eq!(
             map.code_of(&Value::Number(Number::from_f64(1.0).unwrap()))
@@ -1125,6 +1180,27 @@ mod tests {
         assert!(map
             .code_of(&Value::Number(Number::from_f64(3.0).unwrap()))
             .is_err());
+    }
+
+    #[test]
+    fn class_map_orders_numeric_and_categorical_labels_by_declared_kind() {
+        let rows = ["1", "10", "2"]
+            .iter()
+            .map(|value| vec![Value::String((*value).into())])
+            .collect::<Vec<_>>();
+        let numeric = ClassMap::from_context(&rows, 0, rows.len(), true).unwrap();
+        let categorical = ClassMap::from_context(&rows, 0, rows.len(), false).unwrap();
+        assert_eq!(numeric.labels, vec!["1", "2", "10"]);
+        assert_eq!(categorical.labels, vec!["1", "10", "2"]);
+    }
+
+    #[test]
+    fn logits_softmax_uses_all_core_classes_and_rejects_non_finite_values() {
+        let logits = [0.0; CORE_CLASSES];
+        let probabilities = softmax_row(&logits).unwrap();
+        assert!((probabilities.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!((probabilities[0] - 0.1).abs() < 1e-6);
+        assert!(softmax_row(&[f32::NAN, 0.0]).is_err());
     }
 
     #[test]

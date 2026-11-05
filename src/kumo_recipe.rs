@@ -506,8 +506,17 @@ fn validate_indices(indices: &[usize], n: usize) -> Result<(), String> {
 }
 fn number(v: &Value) -> Option<f64> {
     match v {
-        // Keep infinities as numeric inputs. Fitting ignores them, while the
-        // transform's [-100, 100] clamp matches the official recipe.
+        // Non-finite FFI values are represented by reserved strings because JSON
+        // numbers cannot encode infinities; they remain numeric for this recipe.
+        Value::Object(value) => value
+            .get("__tabular_onnx_ffi_infinity__")
+            .and_then(Value::as_str)
+            .and_then(|sign| match sign {
+                "positive" => Some(f64::INFINITY),
+                "negative" => Some(f64::NEG_INFINITY),
+                _ => None,
+            }),
+
         Value::Number(n) => n.as_f64(),
         Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
         _ => None,
@@ -515,6 +524,7 @@ fn number(v: &Value) -> Option<f64> {
 }
 fn category(v: &Value) -> Option<String> {
     match v {
+        Value::Object(value) if value.contains_key("__tabular_onnx_ffi_infinity__") => None,
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
         Value::Bool(b) => Some(b.to_string()),
@@ -653,6 +663,28 @@ mod tests {
         .unwrap();
         assert_eq!(p.x.shape(), &[52, 1]);
         assert_eq!(p.categorical_mask.iter().filter(|&&v| v).count(), 1);
+    }
+
+    #[test]
+    fn numerical_infinity_is_clipped_and_keeps_numeric_semantics() {
+        let infinity = Value::Object(serde_json::Map::from_iter([(
+            "__tabular_onnx_ffi_infinity__".into(),
+            Value::String("positive".into()),
+        )]));
+        let rows = vec![vec![n(1)], vec![n(2)], vec![infinity]];
+        let prepared = prepare_with_feature_types(
+            &rows,
+            &["x"],
+            &[0, 1],
+            &[2],
+            &[0.0, 0.0, 0.0],
+            Task::Regression,
+            &mut StdRng::seed_from_u64(0),
+            Some(&[FeatureType::Numerical]),
+        )
+        .unwrap();
+        assert!(prepared.x[(0, 0)].is_finite());
+        assert!(prepared.x[(1, 0)].is_finite());
     }
 
     #[test]
